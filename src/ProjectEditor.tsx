@@ -2,6 +2,7 @@ import { useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { Project } from "./types";
+import WaveformEditor from "./WaveformEditor";
 
 interface Props {
   project: Project;
@@ -69,19 +70,7 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
       </div>
 
       <div className="editor-body">
-        <div className="project-info">
-          <div className="project-info-label">MP3 File</div>
-          <div className="project-info-value">{project.mp3Path}</div>
-          {project.beatsFilePath && (
-            <>
-              <div className="project-info-label">Project File</div>
-              <div className="project-info-value">{project.beatsFilePath}</div>
-            </>
-          )}
-        </div>
-        <div className="editor-placeholder">
-          Waveform editor coming soon
-        </div>
+        <WaveformEditor mp3Path={project.mp3Path} />
       </div>
     </div>
   );

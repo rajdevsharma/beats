@@ -238,13 +238,69 @@ html, body, #root {
   color: var(--text-muted);
 }
 
-.waveform-container {
+.waveform-canvas {
   flex: 1;
   padding: 16px 0 0;
   overflow: hidden;
+  min-height: 0;
 }
 
-/* Override WaveSurfer's internal scroll container */
-.waveform-container > div {
-  height: 100%;
+/* ── Transport Bar ───────────────────────────── */
+
+.transport-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.transport-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  font-size: 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  font-family: inherit;
+}
+
+.transport-btn:hover {
+  background: var(--card-hover);
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+.transport-play {
+  width: 40px;
+  height: 40px;
+  font-size: 16px;
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
+.transport-play:hover {
+  background: var(--accent-hover);
+  border-color: transparent;
+  color: #fff;
+}
+
+.transport-time {
+  font-size: 13px;
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  color: var(--text-primary);
+  margin-left: 8px;
+}
+
+.transport-duration {
+  color: var(--text-muted);
 }

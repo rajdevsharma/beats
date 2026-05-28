@@ -14,14 +14,20 @@ function formatTime(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}.${cs}`;
 }
 
+const ZOOM_STEP = 1.5;
+const ZOOM_MAX_MULTIPLIER = 120;
+
 export default function WaveformEditor({ mp3Path }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
+  const fitPxPerSecRef = useRef<number>(0);
+
   const [loadProgress, setLoadProgress] = useState(0);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [zoomPxPerSec, setZoomPxPerSec] = useState(0);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -48,11 +54,29 @@ export default function WaveformEditor({ mp3Path }: Props) {
     ws.on("ready", (dur) => {
       setReady(true);
       setDuration(dur);
+      const fit = containerRef.current!.clientWidth / dur;
+      fitPxPerSecRef.current = fit;
+      setZoomPxPerSec(fit);
     });
     ws.on("play", () => setPlaying(true));
     ws.on("pause", () => setPlaying(false));
     ws.on("timeupdate", (t) => setCurrentTime(t));
     ws.on("finish", () => setPlaying(false));
+
+    // Ctrl+wheel zoom
+    function onWheel(e: WheelEvent) {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      const fit = fitPxPerSecRef.current;
+      if (fit === 0) return;
+      const factor = e.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
+      setZoomPxPerSec((prev) => {
+        const next = Math.max(fit, Math.min(prev * factor, fit * ZOOM_MAX_MULTIPLIER));
+        ws.zoom(next);
+        return next;
+      });
+    }
+    containerRef.current.addEventListener("wheel", onWheel, { passive: false });
 
     ws.load(convertFileSrc(mp3Path));
     wsRef.current = ws;
@@ -60,6 +84,7 @@ export default function WaveformEditor({ mp3Path }: Props) {
     return () => {
       ws.destroy();
       wsRef.current = null;
+      containerRef.current?.removeEventListener("wheel", onWheel);
     };
   }, [mp3Path]);
 
@@ -76,13 +101,34 @@ export default function WaveformEditor({ mp3Path }: Props) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
-  function handleSkipToStart() {
-    wsRef.current?.seekTo(0);
+  function applyZoom(next: number) {
+    wsRef.current?.zoom(next);
+    setZoomPxPerSec(next);
   }
 
-  function handlePlayPause() {
-    wsRef.current?.playPause();
+  function handleZoomIn() {
+    const fit = fitPxPerSecRef.current;
+    applyZoom(Math.min(zoomPxPerSec * ZOOM_STEP, fit * ZOOM_MAX_MULTIPLIER));
   }
+
+  function handleZoomOut() {
+    applyZoom(Math.max(zoomPxPerSec / ZOOM_STEP, fitPxPerSecRef.current));
+  }
+
+  function handleZoomFit() {
+    applyZoom(fitPxPerSecRef.current);
+  }
+
+  const atFit = fitPxPerSecRef.current > 0 &&
+    Math.abs(zoomPxPerSec - fitPxPerSecRef.current) < 0.01;
+  const zoomMultiplier = fitPxPerSecRef.current > 0
+    ? zoomPxPerSec / fitPxPerSecRef.current
+    : 1;
+  const zoomLabel = zoomMultiplier < 1.05
+    ? "Fit"
+    : zoomMultiplier >= 10
+    ? `${Math.round(zoomMultiplier)}×`
+    : `${zoomMultiplier.toFixed(1)}×`;
 
   return (
     <div className="waveform-editor">
@@ -105,16 +151,13 @@ export default function WaveformEditor({ mp3Path }: Props) {
 
       {ready && (
         <div className="transport-bar">
-          <button
-            className="transport-btn"
-            onClick={handleSkipToStart}
-            title="Skip to start"
-          >
+          {/* Playback controls */}
+          <button className="transport-btn" onClick={() => wsRef.current?.seekTo(0)} title="Skip to start">
             ⏮
           </button>
           <button
             className="transport-btn transport-play"
-            onClick={handlePlayPause}
+            onClick={() => wsRef.current?.playPause()}
             title={playing ? "Pause (Space)" : "Play (Space)"}
           >
             {playing ? "⏸" : "▶"}
@@ -123,6 +166,21 @@ export default function WaveformEditor({ mp3Path }: Props) {
             {formatTime(currentTime)}
             <span className="transport-duration"> / {formatTime(duration)}</span>
           </span>
+
+          <div className="transport-spacer" />
+
+          {/* Zoom controls */}
+          <span className="zoom-hint">Ctrl+scroll to zoom</span>
+          <button className="transport-btn" onClick={handleZoomOut} title="Zoom out">−</button>
+          <span className="zoom-label">{zoomLabel}</span>
+          <button className="transport-btn" onClick={handleZoomIn} title="Zoom in">+</button>
+          <button
+            className={`transport-btn ${atFit ? "transport-btn-active" : ""}`}
+            onClick={handleZoomFit}
+            title="Fit to window"
+          >
+            ⊡
+          </button>
         </div>
       )}
     </div>

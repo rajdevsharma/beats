@@ -241,7 +241,6 @@ html, body, #root {
 .waveform-canvas {
   flex: 1;
   padding: 16px 0 0;
-  overflow: hidden;
   min-height: 0;
 }
 
@@ -303,4 +302,27 @@ html, body, #root {
 
 .transport-duration {
   color: var(--text-muted);
+}
+
+.transport-spacer {
+  flex: 1;
+}
+
+.zoom-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+
+.zoom-label {
+  font-size: 12px;
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  color: var(--text-secondary);
+  min-width: 36px;
+  text-align: center;
+}
+
+.transport-btn-active {
+  border-color: var(--accent);
+  color: var(--accent);
 }

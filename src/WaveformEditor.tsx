@@ -15,12 +15,15 @@ function formatTime(seconds: number): string {
 }
 
 const ZOOM_STEP = 1.5;
-const ZOOM_MAX_MULTIPLIER = 120;
+const ZOOM_MAX_MULTIPLIER = 500;
+const ZOOM_DEBOUNCE_MS = 80;
 
 export default function WaveformEditor({ mp3Path }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
   const fitPxPerSecRef = useRef<number>(0);
+  const zoomPxPerSecRef = useRef<number>(0);
+  const zoomTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [loadProgress, setLoadProgress] = useState(0);
   const [ready, setReady] = useState(false);
@@ -56,6 +59,7 @@ export default function WaveformEditor({ mp3Path }: Props) {
       setDuration(dur);
       const fit = containerRef.current!.clientWidth / dur;
       fitPxPerSecRef.current = fit;
+      zoomPxPerSecRef.current = fit;
       setZoomPxPerSec(fit);
     });
     ws.on("play", () => setPlaying(true));
@@ -70,11 +74,11 @@ export default function WaveformEditor({ mp3Path }: Props) {
       const fit = fitPxPerSecRef.current;
       if (fit === 0) return;
       const factor = e.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
-      setZoomPxPerSec((prev) => {
-        const next = Math.max(fit, Math.min(prev * factor, fit * ZOOM_MAX_MULTIPLIER));
-        ws.zoom(next);
-        return next;
-      });
+      const next = Math.max(fit, Math.min(zoomPxPerSecRef.current * factor, fit * ZOOM_MAX_MULTIPLIER));
+      zoomPxPerSecRef.current = next;
+      setZoomPxPerSec(next);
+      if (zoomTimerRef.current) clearTimeout(zoomTimerRef.current);
+      zoomTimerRef.current = setTimeout(() => ws.zoom(zoomPxPerSecRef.current), ZOOM_DEBOUNCE_MS);
     }
     containerRef.current.addEventListener("wheel", onWheel, { passive: false });
 
@@ -102,8 +106,10 @@ export default function WaveformEditor({ mp3Path }: Props) {
   }, []);
 
   function applyZoom(next: number) {
-    wsRef.current?.zoom(next);
+    zoomPxPerSecRef.current = next;
     setZoomPxPerSec(next);
+    if (zoomTimerRef.current) clearTimeout(zoomTimerRef.current);
+    zoomTimerRef.current = setTimeout(() => wsRef.current?.zoom(zoomPxPerSecRef.current), ZOOM_DEBOUNCE_MS);
   }
 
   function handleZoomIn() {

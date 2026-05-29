@@ -5,11 +5,13 @@ use std::fs;
 struct BeatsProject {
     version: u32,
     mp3_path: String,
+    #[serde(default)]
+    beats: Vec<f64>,
 }
 
 #[tauri::command]
-fn save_project(path: String, mp3_path: String) -> Result<(), String> {
-    let project = BeatsProject { version: 1, mp3_path };
+fn save_project(path: String, mp3_path: String, beats: Vec<f64>) -> Result<(), String> {
+    let project = BeatsProject { version: 1, mp3_path, beats };
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
     fs::write(path, json).map_err(|e| e.to_string())
 }

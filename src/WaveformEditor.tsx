@@ -5,6 +5,8 @@ import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 
 interface Props {
   mp3Path: string;
+  beats: number[];
+  onBeatsChange: (beats: number[]) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -18,7 +20,7 @@ const ZOOM_STEP = 1.5;
 const ZOOM_MAX_MULTIPLIER = 500;
 const ZOOM_DEBOUNCE_MS = 80;
 
-export default function WaveformEditor({ mp3Path }: Props) {
+export default function WaveformEditor({ mp3Path, beats: _beats, onBeatsChange: _onBeatsChange }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
   const fitPxPerSecRef = useRef<number>(0);

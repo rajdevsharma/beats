@@ -20,7 +20,11 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
   async function doSave(path: string) {
     setSaving(true);
     try {
-      await invoke("save_project", { path, mp3Path: project.mp3Path });
+      await invoke("save_project", {
+        path,
+        mp3Path: project.mp3Path,
+        beats: project.beats,
+      });
       onProjectChange({ ...project, beatsFilePath: path });
     } finally {
       setSaving(false);
@@ -44,6 +48,10 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
     if (path) {
       await doSave(path);
     }
+  }
+
+  function handleBeatsChange(beats: number[]) {
+    onProjectChange({ ...project, beats });
   }
 
   const mp3Name = basename(project.mp3Path);
@@ -70,7 +78,11 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
       </div>
 
       <div className="editor-body">
-        <WaveformEditor mp3Path={project.mp3Path} />
+        <WaveformEditor
+          mp3Path={project.mp3Path}
+          beats={project.beats}
+          onBeatsChange={handleBeatsChange}
+        />
       </div>
     </div>
   );

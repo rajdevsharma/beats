@@ -360,3 +360,75 @@ html, body, #root {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* ── Recording ───────────────────────────────── */
+
+.transport-bar-recording {
+  background: #1a0f0f;
+  border-top-color: #6b2020;
+}
+
+.record-btn {
+  color: #f87171;
+  border-color: #6b2020;
+}
+
+.record-btn:hover {
+  background: #2a1010;
+  border-color: #f87171;
+  color: #fca5a5;
+}
+
+.record-btn-active {
+  background: #7f1d1d !important;
+  border-color: #f87171 !important;
+  color: #fecaca !important;
+}
+
+.rec-indicator {
+  font-size: 11px;
+  font-weight: 600;
+  color: #f87171;
+  letter-spacing: 0.5px;
+  animation: rec-blink 1s step-start infinite;
+}
+
+@keyframes rec-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.beat-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-right: 8px;
+}
+
+/* ── Beat Markers ────────────────────────────── */
+
+/* WaveSurfer renders region divs; we style them to look like vertical lines */
+.waveform-canvas [part="region"] {
+  min-width: 2px !important;
+  border-left: 2px solid rgba(251, 191, 36, 0.9);
+  background: rgba(251, 191, 36, 0.15) !important;
+  overflow: visible !important;
+}
+
+/* ── BPM Labels ──────────────────────────────── */
+
+.beat-label {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 3px);
+  left: 0;
+  font-size: 9px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: rgba(251, 191, 36, 0.9);
+  white-space: nowrap;
+  pointer-events: none;
+  line-height: 1;
+}
+
+.show-beat-labels .beat-label {
+  display: block;
+}

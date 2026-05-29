@@ -56,6 +56,9 @@ export default function WaveformEditor({
   const stretchModeRef = useRef(false);
   const stretchAnchorRef = useRef<number | null>(null);
   const regionJustClickedRef = useRef(false);
+  // Playback rate tracking for per-region rate adjustment
+  const playbackRateRef = useRef(1.0);
+  const activeStretchFactorRef = useRef<number | null>(null);
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
@@ -118,7 +121,17 @@ export default function WaveformEditor({
       setPlaying(false);
       if (recordingRef.current) stopRecording(ws);
     });
-    ws.on("timeupdate", (t) => setCurrentTime(t));
+    ws.on("timeupdate", (t) => {
+      setCurrentTime(t);
+      if (!ws.isPlaying()) return;
+      // Adjust playback rate when entering/exiting a stretch region
+      const stretch = stretchesRef.current.find(s => t >= s.start && t < s.end);
+      const factor = stretch?.factor ?? null;
+      if (factor !== activeStretchFactorRef.current) {
+        activeStretchFactorRef.current = factor;
+        ws.setPlaybackRate(playbackRateRef.current / (factor ?? 1));
+      }
+    });
     ws.on("finish", () => {
       setPlaying(false);
       if (recordingRef.current) stopRecording(ws);
@@ -414,7 +427,10 @@ export default function WaveformEditor({
 
   function handleRateChange(rate: number) {
     setPlaybackRate(rate);
-    wsRef.current?.setPlaybackRate(rate);
+    playbackRateRef.current = rate;
+    // Account for any currently-active stretch region
+    const factor = activeStretchFactorRef.current;
+    wsRef.current?.setPlaybackRate(rate / (factor ?? 1));
   }
 
   // ── Derived display values ─────────────────────────────────────────────────

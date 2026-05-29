@@ -16,6 +16,8 @@ struct BeatsProject {
     beats: Vec<f64>,
     #[serde(default)]
     stretches: Vec<StretchSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baked_wav_path: Option<String>,
 }
 
 #[tauri::command]
@@ -24,15 +26,11 @@ fn save_project(
     mp3_path: String,
     beats: Vec<f64>,
     stretches: Vec<StretchSegment>,
+    baked_wav_path: Option<String>,
 ) -> Result<(), String> {
-    let project = BeatsProject { version: 1, mp3_path, beats, stretches };
+    let project = BeatsProject { version: 1, mp3_path, beats, stretches, baked_wav_path };
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
     fs::write(path, json).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
-    fs::write(path, data).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -46,7 +44,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![save_project, load_project, write_file])
+        .plugin(tauri_plugin_fs::init())
+        .invoke_handler(tauri::generate_handler![save_project, load_project])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

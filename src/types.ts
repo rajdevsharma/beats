@@ -9,6 +9,7 @@ export interface Project {
   beatsFilePath?: string;
   beats: number[];
   stretches: Stretch[];
+  bakedWavPath?: string;
 }
 
 export interface BeatsFileData {
@@ -16,4 +17,5 @@ export interface BeatsFileData {
   mp3_path: string;
   beats?: number[];
   stretches?: Stretch[];
+  baked_wav_path?: string;
 }

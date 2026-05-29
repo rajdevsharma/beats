@@ -480,6 +480,16 @@ html, body, #root {
   white-space: nowrap;
 }
 
+/* Baked overlay — subtler than live, slate-tinted border */
+.waveform-canvas [part="region"][id^="stretch-"].baked-region {
+  border-left-color: rgba(148, 163, 184, 0.5);
+}
+
+.stretch-label-baked {
+  color: rgba(148, 163, 184, 0.8);
+  font-weight: 500;
+}
+
 /* ── Modal ───────────────────────────────────── */
 
 .modal-backdrop {

@@ -3,12 +3,12 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import WaveSurfer from "wavesurfer.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
-import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
 import { decodeAudioFile, buildStretchedBuffer, encodeWav } from "./audioProcessing";
-import { repositionBeats } from "./timeMapping";
+import { repositionBeats, originalToStretched } from "./timeMapping";
 
 interface Props {
   mp3Path: string;
@@ -16,6 +16,8 @@ interface Props {
   onBeatsChange: (beats: number[]) => void;
   stretches: Stretch[];
   onStretchesChange: (stretches: Stretch[]) => void;
+  bakedWavPath?: string;
+  onBakedWavPathChange: (path: string) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -36,6 +38,7 @@ const ANCHOR_REGION_ID = "stretch-anchor";
 
 export default function WaveformEditor({
   mp3Path, beats, onBeatsChange, stretches, onStretchesChange,
+  bakedWavPath, onBakedWavPathChange,
 }: Props) {
   // ── DOM / WaveSurfer refs ──────────────────────────────────────────────────
   const containerRef = useRef<HTMLDivElement>(null);
@@ -63,8 +66,10 @@ export default function WaveformEditor({
   // Playback rate tracking for per-region rate adjustment
   const playbackRateRef = useRef(1.0);
   const activeStretchFactorRef = useRef<number | null>(null);
-  // Decoded original audio buffer (cached for re-render and export)
+  // Decoded original audio buffer (always the original MP3, never the baked WAV)
   const decodedBufferRef = useRef<AudioBuffer | null>(null);
+  // Latest bakedWavPath for use inside the WaveSurfer creation effect
+  const bakedWavPathRef = useRef(bakedWavPath);
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
@@ -90,6 +95,7 @@ export default function WaveformEditor({
   useEffect(() => { selectedBeatTimeRef.current = selectedBeatTime; }, [selectedBeatTime]);
   useEffect(() => { stretchModeRef.current = stretchMode; }, [stretchMode]);
   useEffect(() => { stretchAnchorRef.current = stretchAnchor; }, [stretchAnchor]);
+  useEffect(() => { bakedWavPathRef.current = bakedWavPath; }, [bakedWavPath]);
 
   // ── WaveSurfer + Regions creation ──────────────────────────────────────────
   useEffect(() => {
@@ -190,7 +196,10 @@ export default function WaveformEditor({
     }
     containerRef.current.addEventListener("wheel", onWheel, { passive: false });
 
-    ws.load(convertFileSrc(mp3Path));
+    const initialSrc = bakedWavPathRef.current
+      ? convertFileSrc(bakedWavPathRef.current)
+      : convertFileSrc(mp3Path);
+    ws.load(initialSrc);
     wsRef.current = ws;
 
     return () => {
@@ -323,28 +332,46 @@ export default function WaveformEditor({
     onBeatsChangeRef.current(merged);
   }
 
-  // ── Re-render (Cmd+R) ─────────────────────────────────────────────────────
+  // ── Bake (Cmd+R) ──────────────────────────────────────────────────────────
   async function rerenderWaveform() {
     const ws = wsRef.current;
     if (!ws || rerendering || stretches.length === 0) return;
+
+    // First bake: prompt for save path. Re-bake: silently overwrite.
+    let savePath = bakedWavPathRef.current;
+    if (!savePath) {
+      savePath = await saveDialog({
+        title: "Save Baked Audio",
+        filters: [{ name: "WAV Audio", extensions: ["wav"] }],
+        defaultPath: mp3Path.replace(/\.mp3$/i, "_baked.wav"),
+      }) ?? undefined;
+      if (!savePath) return;
+    }
+
     setRerendering(true);
     ws.pause();
     try {
-      // Decode if not already cached
+      // Always decode from the ORIGINAL mp3, never from the baked WAV
       if (!decodedBufferRef.current) {
         decodedBufferRef.current = await decodeAudioFile(convertFileSrc(mp3Path));
       }
       const stretched = await buildStretchedBuffer(decodedBufferRef.current!, stretches);
-      // Convert to blob URL and reload WaveSurfer
       const wavBytes = encodeWav(stretched);
-      const blob = new Blob([wavBytes], { type: "audio/wav" });
-      const url = URL.createObjectURL(blob);
-      await ws.load(url);
+
+      // Save to disk
+      await writeFile(savePath, wavBytes);
+
+      // Update project with baked path (triggers save-awareness)
+      onBakedWavPathChange(savePath);
+
+      // Load baked WAV into WaveSurfer
+      setReady(false);
+      await ws.load(convertFileSrc(savePath));
+
       // Reposition beats to their stretched time positions
-      const newBeats = repositionBeats(beats, stretches);
-      onBeatsChangeRef.current(newBeats);
-      // Clear stretches — they are now baked into the waveform
-      onStretchesChangeRef.current([]);
+      onBeatsChangeRef.current(repositionBeats(beats, stretches));
+
+      // Stretches are KEPT — they are displayed as baked overlays
     } finally {
       setRerendering(false);
     }
@@ -369,7 +396,7 @@ export default function WaveformEditor({
         ? await buildStretchedBuffer(decodedBufferRef.current!, stretches)
         : decodedBufferRef.current!;
       const wavBytes = encodeWav(processed);
-      await invoke("write_file", { path: outPath, data: Array.from(wavBytes) });
+      await writeFile(outPath, wavBytes);
     } finally {
       setExporting(false);
     }
@@ -460,25 +487,40 @@ export default function WaveformEditor({
 
     rp.getRegions().filter(r => r.id.startsWith("stretch-")).forEach(r => r.remove());
 
+    const isBaked = !!bakedWavPath;
+
     stretches.forEach((s, i) => {
       const pct = Math.round((s.factor - 1) * 100);
+
+      // When showing baked WAV, map overlay coordinates to baked time
+      const displayStart = isBaked
+        ? originalToStretched(s.start, stretches)
+        : s.start;
+      const displayEnd = isBaked
+        ? displayStart + (s.end - s.start) * s.factor
+        : s.end;
+
       const label = document.createElement("div");
-      label.className = "stretch-label";
-      label.textContent = `${pct >= 0 ? "+" : ""}${pct}%`;
+      label.className = `stretch-label${isBaked ? " stretch-label-baked" : ""}`;
+      label.textContent = isBaked
+        ? `✓ ${pct >= 0 ? "+" : ""}${pct}%`
+        : `${pct >= 0 ? "+" : ""}${pct}%`;
 
       rp.addRegion({
         id: `stretch-${i}`,
-        start: s.start,
-        end: s.end,
-        color: s.factor >= 1
-          ? "rgba(34, 197, 94, 0.12)"
-          : "rgba(239, 68, 68, 0.12)",
+        start: displayStart,
+        end: displayEnd,
+        color: isBaked
+          ? "rgba(148, 163, 184, 0.10)"   // muted slate — baked
+          : s.factor >= 1
+            ? "rgba(34, 197, 94, 0.12)"   // green — live slow
+            : "rgba(239, 68, 68, 0.12)",  // red — live fast
         drag: false,
         resize: false,
         content: label,
       });
     });
-  }, [stretches, ready]);
+  }, [stretches, ready, bakedWavPath]);
 
   // ── Zoom helpers ───────────────────────────────────────────────────────────
   function applyZoom(next: number) {
@@ -612,9 +654,11 @@ export default function WaveformEditor({
                 className="transport-btn rerender-btn"
                 onClick={rerenderWaveform}
                 disabled={rerendering}
-                title="Bake stretches into waveform (Cmd+R) — repositions beats, clears stretch regions"
+                title={bakedWavPath
+                  ? "Re-bake: reprocess original MP3 with current stretches (Cmd+R)"
+                  : "Bake: save stretched audio to WAV, load into waveform (Cmd+R)"}
               >
-                {rerendering ? "Rendering…" : "⌘R Bake"}
+                {rerendering ? "Rendering…" : bakedWavPath ? "⌘R Re-bake" : "⌘R Bake"}
               </button>
             </>
           )}

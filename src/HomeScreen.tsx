@@ -26,7 +26,13 @@ export default function HomeScreen({ onProjectOpen }: Props) {
     });
     if (typeof selected === "string") {
       const data: BeatsFileData = await invoke("load_project", { path: selected });
-      onProjectOpen({ mp3Path: data.mp3_path, beatsFilePath: selected, beats: data.beats ?? [], stretches: data.stretches ?? [] });
+      onProjectOpen({
+        mp3Path: data.mp3_path,
+        beatsFilePath: selected,
+        beats: data.beats ?? [],
+        stretches: data.stretches ?? [],
+        bakedWavPath: data.baked_wav_path,
+      });
     }
   }
 

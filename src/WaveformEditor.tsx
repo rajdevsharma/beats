@@ -20,6 +20,8 @@ const ZOOM_STEP = 1.5;
 const ZOOM_MAX_MULTIPLIER = 500;
 const ZOOM_DEBOUNCE_MS = 80;
 
+const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1.0];
+
 export default function WaveformEditor({ mp3Path, beats: _beats, onBeatsChange: _onBeatsChange }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
@@ -33,6 +35,7 @@ export default function WaveformEditor({ mp3Path, beats: _beats, onBeatsChange: 
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [zoomPxPerSec, setZoomPxPerSec] = useState(0);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -127,6 +130,11 @@ export default function WaveformEditor({ mp3Path, beats: _beats, onBeatsChange: 
     applyZoom(fitPxPerSecRef.current);
   }
 
+  function handleRateChange(rate: number) {
+    setPlaybackRate(rate);
+    wsRef.current?.setPlaybackRate(rate);
+  }
+
   const atFit = fitPxPerSecRef.current > 0 &&
     Math.abs(zoomPxPerSec - fitPxPerSecRef.current) < 0.01;
   const zoomMultiplier = fitPxPerSecRef.current > 0
@@ -174,6 +182,19 @@ export default function WaveformEditor({ mp3Path, beats: _beats, onBeatsChange: 
             {formatTime(currentTime)}
             <span className="transport-duration"> / {formatTime(duration)}</span>
           </span>
+
+          <div className="rate-selector">
+            {PLAYBACK_RATES.map((r) => (
+              <button
+                key={r}
+                className={`rate-btn ${playbackRate === r ? "rate-btn-active" : ""}`}
+                onClick={() => handleRateChange(r)}
+                title={r < 1 ? "Pitch shifts at non-1× speeds" : undefined}
+              >
+                {r === 1 ? "1×" : `${r * 100}%`}
+              </button>
+            ))}
+          </div>
 
           <div className="transport-spacer" />
 

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
-import { Project } from "./types";
+import { Project, Stretch } from "./types";
 import WaveformEditor from "./WaveformEditor";
 
 interface Props {
@@ -24,6 +24,7 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
         path,
         mp3Path: project.mp3Path,
         beats: project.beats,
+        stretches: project.stretches,
       });
       onProjectChange({ ...project, beatsFilePath: path });
     } finally {
@@ -45,13 +46,7 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
       filters: [{ name: "Beats Project", extensions: ["beats"] }],
       defaultPath: basename(project.mp3Path).replace(/\.mp3$/i, "") + ".beats",
     });
-    if (path) {
-      await doSave(path);
-    }
-  }
-
-  function handleBeatsChange(beats: number[]) {
-    onProjectChange({ ...project, beats });
+    if (path) await doSave(path);
   }
 
   const mp3Name = basename(project.mp3Path);
@@ -60,9 +55,7 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
   return (
     <div className="editor-screen">
       <div className="editor-toolbar">
-        <button className="toolbar-btn back-btn" onClick={onBack}>
-          ← Back
-        </button>
+        <button className="toolbar-btn back-btn" onClick={onBack}>← Back</button>
         <span className="toolbar-title">
           {mp3Name}
           {!saved && <span className="unsaved-dot" title="Unsaved" />}
@@ -81,7 +74,9 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
         <WaveformEditor
           mp3Path={project.mp3Path}
           beats={project.beats}
-          onBeatsChange={handleBeatsChange}
+          onBeatsChange={(beats) => onProjectChange({ ...project, beats })}
+          stretches={project.stretches}
+          onStretchesChange={(stretches: Stretch[]) => onProjectChange({ ...project, stretches })}
         />
       </div>
     </div>

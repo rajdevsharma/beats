@@ -1,17 +1,31 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+#[derive(Serialize, Deserialize, Clone)]
+struct StretchSegment {
+    start: f64,
+    end: f64,
+    factor: f64,
+}
+
 #[derive(Serialize, Deserialize)]
 struct BeatsProject {
     version: u32,
     mp3_path: String,
     #[serde(default)]
     beats: Vec<f64>,
+    #[serde(default)]
+    stretches: Vec<StretchSegment>,
 }
 
 #[tauri::command]
-fn save_project(path: String, mp3_path: String, beats: Vec<f64>) -> Result<(), String> {
-    let project = BeatsProject { version: 1, mp3_path, beats };
+fn save_project(
+    path: String,
+    mp3_path: String,
+    beats: Vec<f64>,
+    stretches: Vec<StretchSegment>,
+) -> Result<(), String> {
+    let project = BeatsProject { version: 1, mp3_path, beats, stretches };
     let json = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
     fs::write(path, json).map_err(|e| e.to_string())
 }

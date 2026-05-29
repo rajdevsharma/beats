@@ -31,6 +31,11 @@ fn save_project(
 }
 
 #[tauri::command]
+fn write_file(path: String, data: Vec<u8>) -> Result<(), String> {
+    fs::write(path, data).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn load_project(path: String) -> Result<BeatsProject, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     serde_json::from_str(&content).map_err(|e| e.to_string())
@@ -41,7 +46,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![save_project, load_project])
+        .invoke_handler(tauri::generate_handler![save_project, load_project, write_file])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

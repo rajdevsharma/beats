@@ -689,3 +689,21 @@ html, body, #root {
   0%, 100% { opacity: 0.6; }
   50% { opacity: 1; }
 }
+
+/* ── Export ──────────────────────────────────── */
+
+.export-btn {
+  color: #34d399;
+  border-color: #065f46;
+}
+
+.export-btn:hover:not(:disabled) {
+  background: #022c22;
+  border-color: #34d399;
+  color: #6ee7b7;
+}
+
+.export-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

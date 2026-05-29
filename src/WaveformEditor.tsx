@@ -3,6 +3,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import WaveSurfer from "wavesurfer.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
+import { invoke } from "@tauri-apps/api/core";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
 import { decodeAudioFile, buildStretchedBuffer, encodeWav } from "./audioProcessing";
@@ -78,6 +80,7 @@ export default function WaveformEditor({
   const [stretchAnchor, setStretchAnchor] = useState<number | null>(null);
   const [stretchModal, setStretchModal] = useState<{ start: number; end: number } | null>(null);
   const [rerendering, setRerendering] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
@@ -347,6 +350,31 @@ export default function WaveformEditor({
     }
   }
 
+  // ── Export to WAV ──────────────────────────────────────────────────────────
+  async function handleExport() {
+    if (exporting) return;
+    const outPath = await saveDialog({
+      title: "Export as WAV",
+      filters: [{ name: "WAV Audio", extensions: ["wav"] }],
+      defaultPath: mp3Path.replace(/\.mp3$/i, "") + "_stretched.wav",
+    });
+    if (!outPath) return;
+
+    setExporting(true);
+    try {
+      if (!decodedBufferRef.current) {
+        decodedBufferRef.current = await decodeAudioFile(convertFileSrc(mp3Path));
+      }
+      const processed = stretches.length > 0
+        ? await buildStretchedBuffer(decodedBufferRef.current!, stretches)
+        : decodedBufferRef.current!;
+      const wavBytes = encodeWav(processed);
+      await invoke("write_file", { path: outPath, data: Array.from(wavBytes) });
+    } finally {
+      setExporting(false);
+    }
+  }
+
   // ── Stretch modal confirm ──────────────────────────────────────────────────
   function handleStretchConfirm(factor: number) {
     if (!stretchModal) return;
@@ -590,6 +618,16 @@ export default function WaveformEditor({
               </button>
             </>
           )}
+
+          {/* Export */}
+          <button
+            className="transport-btn export-btn"
+            onClick={handleExport}
+            disabled={exporting}
+            title="Export to WAV with all stretches applied"
+          >
+            {exporting ? "Exporting…" : "↓ Export WAV"}
+          </button>
 
           {/* Zoom */}
           <span className="zoom-hint">Ctrl+scroll</span>

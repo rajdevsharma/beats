@@ -432,3 +432,236 @@ html, body, #root {
 .show-beat-labels .beat-label {
   display: block;
 }
+
+/* ── Stretch Mode ────────────────────────────── */
+
+.transport-bar-stretch {
+  background: #0d1a0f;
+  border-top-color: #1a4d2e;
+}
+
+.stretch-btn {
+  color: #4ade80;
+  border-color: #1a4d2e;
+}
+
+.stretch-btn:hover {
+  background: #0d2a14;
+  border-color: #4ade80;
+  color: #86efac;
+}
+
+.stretch-btn-active {
+  background: #14532d !important;
+  border-color: #4ade80 !important;
+  color: #bbf7d0 !important;
+}
+
+.stretch-indicator {
+  font-size: 11px;
+  color: #4ade80;
+  letter-spacing: 0.3px;
+}
+
+.stretch-mode-active {
+  cursor: crosshair;
+}
+
+/* Stretch overlay labels */
+.stretch-label {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: rgba(255, 255, 255, 0.7);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* ── Modal ───────────────────────────────────── */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 420px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: inherit;
+}
+
+.modal-close:hover {
+  color: var(--text-primary);
+  background: var(--card-hover);
+}
+
+.modal-body {
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.modal-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.modal-row-input {
+  align-items: center;
+  margin-top: 4px;
+}
+
+.modal-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.modal-value {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.modal-value.mono {
+  font-family: "SF Mono", "Fira Code", monospace;
+}
+
+.modal-na {
+  color: var(--text-muted);
+  font-style: italic;
+  font-family: inherit;
+}
+
+.modal-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.modal-input-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.modal-input {
+  width: 90px;
+  padding: 6px 10px;
+  font-size: 14px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: var(--text-primary);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  text-align: right;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.modal-input:focus {
+  border-color: var(--accent);
+}
+
+.modal-input-unit {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.modal-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: -4px;
+}
+
+.modal-preview {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 14px 20px 18px;
+  border-top: 1px solid var(--border);
+}
+
+.modal-btn {
+  padding: 7px 18px;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.modal-btn-cancel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.modal-btn-cancel:hover {
+  background: var(--card-hover);
+  color: var(--text-primary);
+}
+
+.modal-btn-confirm {
+  background: var(--accent);
+  border: 1px solid transparent;
+  color: #fff;
+}
+
+.modal-btn-confirm:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.modal-btn-confirm:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

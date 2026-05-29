@@ -3,11 +3,15 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import WaveSurfer from "wavesurfer.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
+import { Stretch } from "./types";
+import StretchModal from "./StretchModal";
 
 interface Props {
   mp3Path: string;
   beats: number[];
   onBeatsChange: (beats: number[]) => void;
+  stretches: Stretch[];
+  onStretchesChange: (stretches: Stretch[]) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -24,8 +28,11 @@ const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1.0];
 const BEAT_WIDTH_S = 0.002;
 const BEAT_COLOR = "rgba(251, 191, 36, 0.80)";
 const BEAT_COLOR_SELECTED = "rgba(255, 100, 60, 0.90)";
+const ANCHOR_REGION_ID = "stretch-anchor";
 
-export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props) {
+export default function WaveformEditor({
+  mp3Path, beats, onBeatsChange, stretches, onStretchesChange,
+}: Props) {
   // ── DOM / WaveSurfer refs ──────────────────────────────────────────────────
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
@@ -36,13 +43,19 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
   const zoomPxPerSecRef = useRef<number>(0);
   const zoomTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── Beat / recording refs (stable for use inside event handlers) ───────────
+  // ── Stable refs for event handlers ────────────────────────────────────────
   const beatsRef = useRef<number[]>(beats);
+  const stretchesRef = useRef<Stretch[]>(stretches);
   const onBeatsChangeRef = useRef(onBeatsChange);
+  const onStretchesChangeRef = useRef(onStretchesChange);
   const recordingRef = useRef(false);
   const recordingStartTimeRef = useRef(0);
   const pendingTapsRef = useRef<number[]>([]);
   const selectedBeatTimeRef = useRef<number | null>(null);
+  const shiftHeldRef = useRef(false);
+  const stretchModeRef = useRef(false);
+  const stretchAnchorRef = useRef<number | null>(null);
+  const regionJustClickedRef = useRef(false);
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
@@ -54,11 +67,18 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
   const [playbackRate, setPlaybackRate] = useState(1.0);
   const [recording, setRecording] = useState(false);
   const [selectedBeatTime, setSelectedBeatTime] = useState<number | null>(null);
+  const [stretchMode, setStretchMode] = useState(false);
+  const [stretchAnchor, setStretchAnchor] = useState<number | null>(null);
+  const [stretchModal, setStretchModal] = useState<{ start: number; end: number } | null>(null);
 
-  // Keep stable refs in sync with latest props/state
+  // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
+  useEffect(() => { stretchesRef.current = stretches; }, [stretches]);
   useEffect(() => { onBeatsChangeRef.current = onBeatsChange; }, [onBeatsChange]);
+  useEffect(() => { onStretchesChangeRef.current = onStretchesChange; }, [onStretchesChange]);
   useEffect(() => { selectedBeatTimeRef.current = selectedBeatTime; }, [selectedBeatTime]);
+  useEffect(() => { stretchModeRef.current = stretchMode; }, [stretchMode]);
+  useEffect(() => { stretchAnchorRef.current = stretchAnchor; }, [stretchAnchor]);
 
   // ── WaveSurfer + Regions creation ──────────────────────────────────────────
   useEffect(() => {
@@ -104,12 +124,34 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
       if (recordingRef.current) stopRecording(ws);
     });
 
-    // Shift+click on waveform → add beat at that position
     ws.on("interaction", () => {
-      if (!shiftHeldRef.current) return;
+      // Ignore if the click landed on a region element
+      if (regionJustClickedRef.current) return;
+
       const t = ws.getCurrentTime();
-      const updated = [...beatsRef.current, t].sort((a, b) => a - b);
-      onBeatsChangeRef.current(updated);
+
+      if (stretchModeRef.current) {
+        if (shiftHeldRef.current && stretchAnchorRef.current !== null) {
+          // Second point → open modal
+          const a = stretchAnchorRef.current;
+          const start = Math.min(a, t);
+          const end = Math.max(a, t);
+          if (end - start > 0.01) {
+            setStretchModal({ start, end });
+          }
+        } else if (!shiftHeldRef.current) {
+          // First point → set anchor
+          stretchAnchorRef.current = t;
+          setStretchAnchor(t);
+        }
+        return;
+      }
+
+      // Normal mode: shift+click adds a beat
+      if (shiftHeldRef.current) {
+        const updated = [...beatsRef.current, t].sort((a, b) => a - b);
+        onBeatsChangeRef.current(updated);
+      }
     });
 
     // Ctrl+wheel zoom
@@ -138,34 +180,67 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
     };
   }, [mp3Path]);
 
-  // ── Keyboard: Space, R, B, Delete, Shift tracking ─────────────────────────
-  const shiftHeldRef = useRef(false);
-
+  // ── Keyboard handlers ──────────────────────────────────────────────────────
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const tag = (e.target as HTMLElement).tagName;
       const isInput = tag === "INPUT" || tag === "TEXTAREA";
 
       if (e.key === "Shift") { shiftHeldRef.current = true; return; }
-
       if (isInput) return;
 
+      // Space → play/pause
       if (e.code === "Space") {
         e.preventDefault();
         wsRef.current?.playPause();
         return;
       }
 
-      if (e.code === "KeyR") {
-        e.preventDefault();
-        if (recordingRef.current) {
-          stopRecording(wsRef.current!);
-        } else {
-          startRecording();
+      // Escape → cancel stretch anchor / exit stretch mode
+      if (e.code === "Escape") {
+        if (stretchAnchorRef.current !== null) {
+          stretchAnchorRef.current = null;
+          setStretchAnchor(null);
+        } else if (stretchModeRef.current) {
+          stretchModeRef.current = false;
+          setStretchMode(false);
         }
         return;
       }
 
+      // T → toggle stretch mode
+      if (e.code === "KeyT") {
+        e.preventDefault();
+        const next = !stretchModeRef.current;
+        stretchModeRef.current = next;
+        setStretchMode(next);
+        if (!next) {
+          stretchAnchorRef.current = null;
+          setStretchAnchor(null);
+        }
+        return;
+      }
+
+      // S → open stretch modal using anchor → current cursor
+      if (e.code === "KeyS" && stretchModeRef.current && stretchAnchorRef.current !== null) {
+        e.preventDefault();
+        const t = wsRef.current?.getCurrentTime() ?? 0;
+        const a = stretchAnchorRef.current;
+        const start = Math.min(a, t);
+        const end = Math.max(a, t);
+        if (end - start > 0.01) setStretchModal({ start, end });
+        return;
+      }
+
+      // R → toggle beat recording
+      if (e.code === "KeyR") {
+        e.preventDefault();
+        if (recordingRef.current) stopRecording(wsRef.current!);
+        else startRecording();
+        return;
+      }
+
+      // B → tap beat while recording
       if (e.code === "KeyB" && recordingRef.current) {
         e.preventDefault();
         const t = wsRef.current?.getCurrentTime();
@@ -173,6 +248,7 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
         return;
       }
 
+      // Delete / Backspace → remove selected beat
       if ((e.code === "Delete" || e.code === "Backspace") && selectedBeatTimeRef.current !== null) {
         e.preventDefault();
         const sel = selectedBeatTimeRef.current;
@@ -214,18 +290,32 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
     const endTime = ws.getCurrentTime();
     const taps = pendingTapsRef.current;
     pendingTapsRef.current = [];
-    // Replace any pre-existing beats in the swept range with new taps
     const kept = beatsRef.current.filter(t => t < startTime || t > endTime);
     const merged = [...kept, ...taps].sort((a, b) => a - b);
     onBeatsChangeRef.current(merged);
   }
 
-  // ── Beat region sync ───────────────────────────────────────────────────────
+  // ── Stretch modal confirm ──────────────────────────────────────────────────
+  function handleStretchConfirm(factor: number) {
+    if (!stretchModal) return;
+    const { start, end } = stretchModal;
+    // Merge with existing, replacing any that overlap this range
+    const kept = stretchesRef.current.filter(s => s.end <= start || s.start >= end);
+    const updated: Stretch[] = [...kept, { start, end, factor }]
+      .sort((a, b) => a.start - b.start);
+    onStretchesChangeRef.current(updated);
+    setStretchModal(null);
+    stretchAnchorRef.current = null;
+    setStretchAnchor(null);
+  }
+
+  // ── Beat region sync (only touches beat-* regions) ────────────────────────
   useEffect(() => {
     const rp = regionsRef.current;
     if (!rp || !ready) return;
 
-    rp.clearRegions();
+    // Remove only beat regions, leaving anchor/stretch regions intact
+    rp.getRegions().filter(r => r.id.startsWith("beat-")).forEach(r => r.remove());
 
     beats.forEach((t, i) => {
       const bpm = i < beats.length - 1 ? 60 / (beats[i + 1] - t) : null;
@@ -247,6 +337,8 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
 
       region.on("click", (e) => {
         e.stopPropagation();
+        regionJustClickedRef.current = true;
+        setTimeout(() => { regionJustClickedRef.current = false; }, 50);
         selectedBeatTimeRef.current = t;
         setSelectedBeatTime(t);
       });
@@ -262,6 +354,52 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
     });
   }, [beats, ready, selectedBeatTime]);
 
+  // ── Stretch anchor region sync ─────────────────────────────────────────────
+  useEffect(() => {
+    const rp = regionsRef.current;
+    if (!rp || !ready) return;
+
+    rp.getRegions().filter(r => r.id === ANCHOR_REGION_ID).forEach(r => r.remove());
+
+    if (stretchAnchor !== null && stretchMode) {
+      rp.addRegion({
+        id: ANCHOR_REGION_ID,
+        start: stretchAnchor,
+        end: stretchAnchor + 0.001,
+        color: "rgba(59, 130, 246, 0.9)",
+        drag: false,
+        resize: false,
+      });
+    }
+  }, [stretchAnchor, stretchMode, ready]);
+
+  // ── Stretch overlay regions sync ───────────────────────────────────────────
+  useEffect(() => {
+    const rp = regionsRef.current;
+    if (!rp || !ready) return;
+
+    rp.getRegions().filter(r => r.id.startsWith("stretch-")).forEach(r => r.remove());
+
+    stretches.forEach((s, i) => {
+      const pct = Math.round((s.factor - 1) * 100);
+      const label = document.createElement("div");
+      label.className = "stretch-label";
+      label.textContent = `${pct >= 0 ? "+" : ""}${pct}%`;
+
+      rp.addRegion({
+        id: `stretch-${i}`,
+        start: s.start,
+        end: s.end,
+        color: s.factor >= 1
+          ? "rgba(34, 197, 94, 0.12)"
+          : "rgba(239, 68, 68, 0.12)",
+        drag: false,
+        resize: false,
+        content: label,
+      });
+    });
+  }, [stretches, ready]);
+
   // ── Zoom helpers ───────────────────────────────────────────────────────────
   function applyZoom(next: number) {
     zoomPxPerSecRef.current = next;
@@ -270,17 +408,9 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
     zoomTimerRef.current = setTimeout(() => wsRef.current?.zoom(zoomPxPerSecRef.current), ZOOM_DEBOUNCE_MS);
   }
 
-  function handleZoomIn() {
-    applyZoom(Math.min(zoomPxPerSec * ZOOM_STEP, fitPxPerSecRef.current * ZOOM_MAX_MULTIPLIER));
-  }
-
-  function handleZoomOut() {
-    applyZoom(Math.max(zoomPxPerSec / ZOOM_STEP, fitPxPerSecRef.current));
-  }
-
-  function handleZoomFit() {
-    applyZoom(fitPxPerSecRef.current);
-  }
+  const handleZoomIn = () => applyZoom(Math.min(zoomPxPerSec * ZOOM_STEP, fitPxPerSecRef.current * ZOOM_MAX_MULTIPLIER));
+  const handleZoomOut = () => applyZoom(Math.max(zoomPxPerSec / ZOOM_STEP, fitPxPerSecRef.current));
+  const handleZoomFit = () => applyZoom(fitPxPerSecRef.current);
 
   function handleRateChange(rate: number) {
     setPlaybackRate(rate);
@@ -294,7 +424,6 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
     : zoomMultiplier >= 10 ? `${Math.round(zoomMultiplier)}×`
     : `${zoomMultiplier.toFixed(1)}×`;
 
-  // Show BPM labels when adjacent beats are at least 40px apart
   const minBeatGap = beats.length > 1
     ? Math.min(...beats.slice(1).map((t, i) => t - beats[i]))
     : Infinity;
@@ -316,12 +445,21 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
 
       <div
         ref={containerRef}
-        className={`waveform-canvas${showLabels ? " show-beat-labels" : ""}`}
+        className={[
+          "waveform-canvas",
+          showLabels ? "show-beat-labels" : "",
+          stretchMode ? "stretch-mode-active" : "",
+        ].filter(Boolean).join(" ")}
         style={{ visibility: ready ? "visible" : "hidden" }}
       />
 
       {ready && (
-        <div className={`transport-bar${recording ? " transport-bar-recording" : ""}`}>
+        <div className={[
+          "transport-bar",
+          recording ? "transport-bar-recording" : "",
+          stretchMode ? "transport-bar-stretch" : "",
+        ].filter(Boolean).join(" ")}>
+
           {/* Playback */}
           <button className="transport-btn" onClick={() => wsRef.current?.seekTo(0)} title="Skip to start">⏮</button>
           <button
@@ -341,7 +479,7 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
             {PLAYBACK_RATES.map((r) => (
               <button
                 key={r}
-                className={`rate-btn ${playbackRate === r ? "rate-btn-active" : ""}`}
+                className={`rate-btn${playbackRate === r ? " rate-btn-active" : ""}`}
                 onClick={() => handleRateChange(r)}
                 title={r < 1 ? "Pitch shifts at non-1× speeds" : undefined}
               >
@@ -354,22 +492,37 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
           <button
             className={`transport-btn record-btn${recording ? " record-btn-active" : ""}`}
             onClick={() => recording ? stopRecording(wsRef.current!) : startRecording()}
-            title={recording ? "Stop recording (R) — Esc also works" : "Record beats (R), tap B on each beat"}
+            title={recording ? "Stop recording (R)" : "Record beats (R), tap B on each beat"}
           >
             {recording ? "■ Stop" : "● Rec"}
           </button>
-          {recording && (
-            <span className="rec-indicator" title="Tap B on each beat">
-              REC · tap B
+          {recording && <span className="rec-indicator">REC · tap B</span>}
+
+          {/* Stretch mode */}
+          <button
+            className={`transport-btn stretch-btn${stretchMode ? " stretch-btn-active" : ""}`}
+            onClick={() => {
+              const next = !stretchMode;
+              setStretchMode(next);
+              stretchModeRef.current = next;
+              if (!next) { setStretchAnchor(null); stretchAnchorRef.current = null; }
+            }}
+            title={stretchMode ? "Exit stretch mode (T or Esc)" : "Stretch mode (T): click anchor, Shift+click end"}
+          >
+            ⇔ Stretch
+          </button>
+          {stretchMode && (
+            <span className="stretch-indicator">
+              {stretchAnchor !== null
+                ? `${formatTime(stretchAnchor)} → Shift+click end (or S)`
+                : "Click to set anchor"}
             </span>
           )}
 
           <div className="transport-spacer" />
 
-          {/* Beat count */}
-          {beats.length > 0 && (
-            <span className="beat-count">{beats.length} beats</span>
-          )}
+          {beats.length > 0 && <span className="beat-count">{beats.length} beats</span>}
+          {stretches.length > 0 && <span className="beat-count">{stretches.length} stretch{stretches.length !== 1 ? "es" : ""}</span>}
 
           {/* Zoom */}
           <span className="zoom-hint">Ctrl+scroll</span>
@@ -382,6 +535,16 @@ export default function WaveformEditor({ mp3Path, beats, onBeatsChange }: Props)
             title="Fit to window"
           >⊡</button>
         </div>
+      )}
+
+      {stretchModal && (
+        <StretchModal
+          start={stretchModal.start}
+          end={stretchModal.end}
+          beats={beats}
+          onConfirm={handleStretchConfirm}
+          onCancel={() => setStretchModal(null)}
+        />
       )}
     </div>
   );

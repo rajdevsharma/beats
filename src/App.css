@@ -665,3 +665,27 @@ html, body, #root {
   opacity: 0.4;
   cursor: default;
 }
+
+/* ── Re-render ───────────────────────────────── */
+
+.rerender-btn {
+  color: #a78bfa;
+  border-color: #3b2a6b;
+}
+
+.rerender-btn:hover:not(:disabled) {
+  background: #1e1040;
+  border-color: #a78bfa;
+  color: #c4b5fd;
+}
+
+.rerender-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  animation: rerender-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes rerender-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}

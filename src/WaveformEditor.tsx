@@ -5,6 +5,8 @@ import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
+import { decodeAudioFile, buildStretchedBuffer, encodeWav } from "./audioProcessing";
+import { repositionBeats } from "./timeMapping";
 
 interface Props {
   mp3Path: string;
@@ -59,6 +61,8 @@ export default function WaveformEditor({
   // Playback rate tracking for per-region rate adjustment
   const playbackRateRef = useRef(1.0);
   const activeStretchFactorRef = useRef<number | null>(null);
+  // Decoded original audio buffer (cached for re-render and export)
+  const decodedBufferRef = useRef<AudioBuffer | null>(null);
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
@@ -73,6 +77,7 @@ export default function WaveformEditor({
   const [stretchMode, setStretchMode] = useState(false);
   const [stretchAnchor, setStretchAnchor] = useState<number | null>(null);
   const [stretchModal, setStretchModal] = useState<{ start: number; end: number } | null>(null);
+  const [rerendering, setRerendering] = useState(false);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
@@ -202,6 +207,13 @@ export default function WaveformEditor({
       if (e.key === "Shift") { shiftHeldRef.current = true; return; }
       if (isInput) return;
 
+      // Cmd+R → re-render waveform with stretches baked in
+      if (e.code === "KeyR" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        rerenderWaveform();
+        return;
+      }
+
       // Space → play/pause
       if (e.code === "Space") {
         e.preventDefault();
@@ -306,6 +318,33 @@ export default function WaveformEditor({
     const kept = beatsRef.current.filter(t => t < startTime || t > endTime);
     const merged = [...kept, ...taps].sort((a, b) => a - b);
     onBeatsChangeRef.current(merged);
+  }
+
+  // ── Re-render (Cmd+R) ─────────────────────────────────────────────────────
+  async function rerenderWaveform() {
+    const ws = wsRef.current;
+    if (!ws || rerendering || stretches.length === 0) return;
+    setRerendering(true);
+    ws.pause();
+    try {
+      // Decode if not already cached
+      if (!decodedBufferRef.current) {
+        decodedBufferRef.current = await decodeAudioFile(convertFileSrc(mp3Path));
+      }
+      const stretched = await buildStretchedBuffer(decodedBufferRef.current!, stretches);
+      // Convert to blob URL and reload WaveSurfer
+      const wavBytes = encodeWav(stretched);
+      const blob = new Blob([wavBytes], { type: "audio/wav" });
+      const url = URL.createObjectURL(blob);
+      await ws.load(url);
+      // Reposition beats to their stretched time positions
+      const newBeats = repositionBeats(beats, stretches);
+      onBeatsChangeRef.current(newBeats);
+      // Clear stretches — they are now baked into the waveform
+      onStretchesChangeRef.current([]);
+    } finally {
+      setRerendering(false);
+    }
   }
 
   // ── Stretch modal confirm ──────────────────────────────────────────────────
@@ -538,7 +577,19 @@ export default function WaveformEditor({
           <div className="transport-spacer" />
 
           {beats.length > 0 && <span className="beat-count">{beats.length} beats</span>}
-          {stretches.length > 0 && <span className="beat-count">{stretches.length} stretch{stretches.length !== 1 ? "es" : ""}</span>}
+          {stretches.length > 0 && (
+            <>
+              <span className="beat-count">{stretches.length} stretch{stretches.length !== 1 ? "es" : ""}</span>
+              <button
+                className="transport-btn rerender-btn"
+                onClick={rerenderWaveform}
+                disabled={rerendering}
+                title="Bake stretches into waveform (Cmd+R) — repositions beats, clears stretch regions"
+              >
+                {rerendering ? "Rendering…" : "⌘R Bake"}
+              </button>
+            </>
+          )}
 
           {/* Zoom */}
           <span className="zoom-hint">Ctrl+scroll</span>

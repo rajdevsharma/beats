@@ -7,7 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
-import { repositionBeats, originalToStretched } from "./timeMapping";
+import { originalToStretched } from "./timeMapping";
 
 interface Props {
   mp3Path: string;
@@ -28,7 +28,6 @@ function formatTime(seconds: number): string {
 
 interface PositionEvent { t: number; playing: boolean; }
 interface LoadResult { peaks: number[][]; duration: number; sample_rate: number; channels: number; }
-interface SetStretchesResult { peaks: number[][]; warped_duration: number; }
 
 const ZOOM_STEP = 1.5;
 const ZOOM_MAX_MULTIPLIER = 500;
@@ -207,24 +206,15 @@ export default function WaveformEditor({
         const ws = wsRef.current;
         if (!ws) return;
 
-        // If the project already has stretches, apply them immediately so the
-        // warped waveform is shown (avoids a second load cycle after ready).
-        let peaksToUse = result.peaks;
-        let durToUse = result.duration;
+        // WaveSurfer always shows the original waveform (original time axis).
+        // Cursor is driven by original-time position events — no remapping needed.
+        // If stretches exist, pre-warm the engine's warped buffer so playback is ready.
         if (stretchesRef.current.length > 0) {
-          try {
-            const sr = await invoke<SetStretchesResult>("set_stretches_audio", {
-              stretches: stretchesRef.current,
-            });
-            peaksToUse = sr.peaks;
-            durToUse = sr.warped_duration;
-          } catch {
-            // Non-fatal: fall back to original peaks
-          }
+          invoke("set_stretches_audio", { stretches: stretchesRef.current }).catch(console.error);
         }
 
-        const channelData = peaksToUse.map(ch => new Float32Array(ch));
-        await ws.load("", channelData, durToUse);
+        const channelData = result.peaks.map(ch => new Float32Array(ch));
+        await ws.load("", channelData, result.duration);
       } catch (e) {
         if (!cancelled) setLoadError(String(e));
       }
@@ -252,25 +242,11 @@ export default function WaveformEditor({
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
-  // ── Stretches → Rust engine sync (also rebuilds warped waveform) ──────────
+  // ── Stretches → Rust engine sync ─────────────────────────────────────────
+  // WaveSurfer keeps the original waveform; we only update the engine.
   useEffect(() => {
     if (!ready) return;
-    const savedZoom = zoomPxPerSecRef.current;
-    invoke<SetStretchesResult>("set_stretches_audio", { stretches })
-      .then((result) => {
-        const ws = wsRef.current;
-        if (!ws) return;
-        const channelData = result.peaks.map(ch => new Float32Array(ch));
-        // After reload, restore zoom so the view doesn't jump back to Fit.
-        ws.load("", channelData, result.warped_duration).then(() => {
-          if (savedZoom > fitPxPerSecRef.current) {
-            ws.zoom(savedZoom);
-            zoomPxPerSecRef.current = savedZoom;
-            setZoomPxPerSec(savedZoom);
-          }
-        });
-      })
-      .catch(console.error);
+    invoke("set_stretches_audio", { stretches }).catch(console.error);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stretches]);
 
@@ -393,6 +369,8 @@ export default function WaveformEditor({
   }
 
   // ── Bake (Cmd+R) ──────────────────────────────────────────────────────────
+  // Bake is purely a high-quality file export. The engine already plays the
+  // Rubber Band offline result from its warped buffer — quality is identical.
   async function rerenderWaveform() {
     if (rerendering || stretches.length === 0) return;
 
@@ -407,21 +385,9 @@ export default function WaveformEditor({
     }
 
     setRerendering(true);
-    if (playingRef.current) await invoke("pause_audio");
     try {
       await invoke("bake_audio", { mp3Path, stretches, outputPath: savePath });
       onBakedWavPathChange(savePath);
-      // Reload Rust engine with the baked WAV
-      const result = await invoke<LoadResult>("load_audio", { path: savePath });
-      setDuration(result.duration);
-      durationRef.current = result.duration;
-      const ws = wsRef.current;
-      if (ws) {
-        const channelData = result.peaks.map(ch => new Float32Array(ch));
-        setReady(false);
-        await ws.load("", channelData, result.duration);
-      }
-      onBeatsChangeRef.current(repositionBeats(beats, stretches));
     } finally {
       setRerendering(false);
     }

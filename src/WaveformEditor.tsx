@@ -223,6 +223,14 @@ export default function WaveformEditor({
     return () => { cancelled = true; };
   }, [mp3Path]);
 
+  // ── Listen to Rust decode-progress events ─────────────────────────────────
+  useEffect(() => {
+    const unlisten = listen<number>("load-progress", (ev) => {
+      setLoadProgress(ev.payload);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
   // ── Listen to Rust position events ────────────────────────────────────────
   useEffect(() => {
     const unlisten = listen<PositionEvent>("audio-position", (ev) => {
@@ -575,7 +583,9 @@ export default function WaveformEditor({
             <div className="waveform-loading-fill" style={{ width: `${loadProgress}%` }} />
           </div>
           <span className="waveform-loading-label">
-            {loadProgress < 80 ? "Decoding…" : loadProgress < 100 ? "Loading waveform…" : "Rendering…"}
+            {loadProgress < 80
+              ? `Decoding audio… ${loadProgress}%`
+              : loadProgress < 100 ? "Computing peaks…" : "Rendering…"}
           </span>
         </div>
       )}

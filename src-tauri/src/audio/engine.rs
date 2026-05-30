@@ -16,7 +16,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use super::{apply_stretches, StretchSeg};
-use super::decode::decode_audio_file;
+use super::decode::decode_audio_file_with_progress;
 use super::rubberband::stretch_offline;
 
 // ── Shared state between engine and cpal callback ─────────────────────────
@@ -33,7 +33,8 @@ struct StreamShared {
 struct Inner {
     sample_rate: u32,
     channels: usize,
-    original: Vec<f32>,
+    /// Original PCM shared via Arc to avoid cloning for stretch processing.
+    original: Arc<Vec<f32>>,
     /// Original with user stretch regions applied (Rubber Band offline).
     warped: Arc<Vec<f32>>,
     /// warped processed by global rate (1/rate time ratio). Equals warped when rate == 1.
@@ -62,7 +63,7 @@ impl AudioEngine {
             inner: Mutex::new(Inner {
                 sample_rate: 44100,
                 channels: 2,
-                original: Vec::new(),
+                original: Arc::clone(&empty),
                 warped: Arc::clone(&empty),
                 playback_buf: Arc::clone(&empty),
                 stretches: Vec::new(),
@@ -102,10 +103,9 @@ fn compute_peaks(samples: &[f32], channels: usize, sample_rate: u32) -> Vec<Vec<
 
 /// Apply a global playback rate to an already-warped buffer.
 /// rate = 0.75 → time_ratio = 1/0.75 ≈ 1.333 (slower, pitch-correct via RubberBand).
-fn apply_rate(warped: &[f32], channels: usize, sample_rate: u32, rate: f64) -> Arc<Vec<f32>> {
+fn apply_rate(warped: &Arc<Vec<f32>>, channels: usize, sample_rate: u32, rate: f64) -> Arc<Vec<f32>> {
     if (rate - 1.0).abs() < 1e-6 || warped.is_empty() {
-        // No processing needed — share the warped buffer directly
-        return Arc::new(warped.to_vec());
+        return Arc::clone(warped); // share the buffer, no copy
     }
     let time_ratio = 1.0 / rate;
     Arc::new(stretch_offline(warped, channels, sample_rate, time_ratio))
@@ -289,20 +289,35 @@ pub struct SetStretchesResult {
 #[tauri::command]
 pub async fn load_audio(
     path: String,
+    app: AppHandle,
     engine: tauri::State<'_, Arc<AudioEngine>>,
 ) -> Result<LoadResult, String> {
     let eng = Arc::clone(&engine);
     tokio::task::spawn_blocking(move || {
-        let decoded = decode_audio_file(&path)?;
+        // Stop any current playback before loading.
+        eng.is_playing.store(false, Ordering::Relaxed);
+        drop(eng.stream.lock().unwrap().take());
+
+        let decoded = decode_audio_file_with_progress(&path, |frac| {
+            // Emit progress in the 5–75% range so the frontend progress bar
+            // stays meaningful: 0–5% = "started", 75–100% = "computing peaks/ready".
+            let pct = (5.0 + frac * 70.0) as u8;
+            let _ = app.emit("load-progress", pct);
+        })?;
+
+        let _ = app.emit("load-progress", 80u8);
         let peaks = compute_peaks(&decoded.samples, decoded.channels, decoded.sample_rate);
-        let warped = Arc::new(decoded.samples.clone());
+        let _ = app.emit("load-progress", 95u8);
+
+        // Share original PCM via Arc — no clone needed for stretch processing.
+        let original = Arc::new(decoded.samples);
         {
             let mut inner = eng.inner.lock().unwrap();
             inner.sample_rate = decoded.sample_rate;
             inner.channels = decoded.channels;
-            inner.original = decoded.samples;
-            inner.warped = Arc::clone(&warped);
-            inner.playback_buf = Arc::clone(&warped); // rate=1 on load
+            inner.original = Arc::clone(&original);
+            inner.warped = Arc::clone(&original); // no stretches yet
+            inner.playback_buf = Arc::clone(&original); // rate=1
             inner.playback_rate = 1.0;
             inner.stretches = Vec::new();
             inner.original_duration_secs = decoded.duration_secs;
@@ -310,8 +325,6 @@ pub async fn load_audio(
             inner.warped_peaks = peaks.clone();
         }
         eng.position.store(0, Ordering::Relaxed);
-        eng.is_playing.store(false, Ordering::Relaxed);
-        drop(eng.stream.lock().unwrap().take());
 
         Ok(LoadResult {
             peaks,
@@ -333,7 +346,8 @@ pub async fn set_stretches_audio(
     tokio::task::spawn_blocking(move || {
         let (original, sample_rate, channels, rate) = {
             let inner = eng.inner.lock().unwrap();
-            (inner.original.clone(), inner.sample_rate, inner.channels, inner.playback_rate)
+            // Clone just the Arc pointer, not the PCM data.
+            (Arc::clone(&inner.original), inner.sample_rate, inner.channels, inner.playback_rate)
         };
         if original.is_empty() {
             return Err("no audio loaded".to_string());
@@ -343,8 +357,8 @@ pub async fn set_stretches_audio(
         let new_warped_frames = new_warped.len() / channels;
         let new_warped_duration = new_warped_frames as f64 / sample_rate as f64;
         let peaks = compute_peaks(&new_warped, channels, sample_rate);
-        let new_playback = apply_rate(&new_warped, channels, sample_rate, rate);
         let new_warped = Arc::new(new_warped);
+        let new_playback = apply_rate(&new_warped, channels, sample_rate, rate);
 
         // Remap current position into new playback_buf space
         let old_pb_frame = eng.position.load(Ordering::Relaxed) as usize;
@@ -399,7 +413,7 @@ pub async fn set_playback_rate(
                 return Ok(()); // nothing to do
             }
             (
-                inner.warped.as_ref().clone(),
+                Arc::clone(&inner.warped), // cheap Arc clone
                 inner.channels,
                 inner.sample_rate,
                 inner.stretches.clone(),

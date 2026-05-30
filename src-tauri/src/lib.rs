@@ -1,3 +1,5 @@
+mod audio;
+
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -45,7 +47,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![save_project, load_project])
+        .invoke_handler(tauri::generate_handler![
+            save_project,
+            load_project,
+            audio::bake_audio,
+            audio::export_mp3,
+            audio::get_audio_duration,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

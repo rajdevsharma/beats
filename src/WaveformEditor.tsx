@@ -3,11 +3,10 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import WaveSurfer from "wavesurfer.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
+import { invoke } from "@tauri-apps/api/core";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
-import { decodeAudioFile, buildStretchedBuffer, encodeWav } from "./audioProcessing";
 import { repositionBeats, originalToStretched } from "./timeMapping";
 
 interface Props {
@@ -63,11 +62,6 @@ export default function WaveformEditor({
   const stretchModeRef = useRef(false);
   const stretchAnchorRef = useRef<number | null>(null);
   const regionJustClickedRef = useRef(false);
-  // Playback rate tracking for per-region rate adjustment
-  const playbackRateRef = useRef(1.0);
-  const activeStretchFactorRef = useRef<number | null>(null);
-  // Decoded original audio buffer (always the original MP3, never the baked WAV)
-  const decodedBufferRef = useRef<AudioBuffer | null>(null);
   // Latest bakedWavPath for use inside the WaveSurfer creation effect
   const bakedWavPathRef = useRef(bakedWavPath);
 
@@ -86,6 +80,7 @@ export default function WaveformEditor({
   const [stretchModal, setStretchModal] = useState<{ start: number; end: number } | null>(null);
   const [rerendering, setRerendering] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
@@ -135,17 +130,7 @@ export default function WaveformEditor({
       setPlaying(false);
       if (recordingRef.current) stopRecording(ws);
     });
-    ws.on("timeupdate", (t) => {
-      setCurrentTime(t);
-      if (!ws.isPlaying()) return;
-      // Adjust playback rate when entering/exiting a stretch region
-      const stretch = stretchesRef.current.find(s => t >= s.start && t < s.end);
-      const factor = stretch?.factor ?? null;
-      if (factor !== activeStretchFactorRef.current) {
-        activeStretchFactorRef.current = factor;
-        ws.setPlaybackRate(playbackRateRef.current / (factor ?? 1));
-      }
-    });
+    ws.on("timeupdate", (t) => setCurrentTime(t));
     ws.on("finish", () => {
       setPlaying(false);
       if (recordingRef.current) stopRecording(ws);
@@ -332,7 +317,7 @@ export default function WaveformEditor({
     onBeatsChangeRef.current(merged);
   }
 
-  // ── Bake (Cmd+R) ──────────────────────────────────────────────────────────
+  // ── Bake (Cmd+R) — Rubber Band offline, pitch-correct ─────────────────────
   async function rerenderWaveform() {
     const ws = wsRef.current;
     if (!ws || rerendering || stretches.length === 0) return;
@@ -341,7 +326,7 @@ export default function WaveformEditor({
     let savePath = bakedWavPathRef.current;
     if (!savePath) {
       savePath = await saveDialog({
-        title: "Save Baked Audio",
+        title: "Save Baked Audio (WAV)",
         filters: [{ name: "WAV Audio", extensions: ["wav"] }],
         defaultPath: mp3Path.replace(/\.mp3$/i, "_baked.wav"),
       }) ?? undefined;
@@ -351,52 +336,38 @@ export default function WaveformEditor({
     setRerendering(true);
     ws.pause();
     try {
-      // Always decode from the ORIGINAL mp3, never from the baked WAV
-      if (!decodedBufferRef.current) {
-        decodedBufferRef.current = await decodeAudioFile(convertFileSrc(mp3Path));
-      }
-      const stretched = await buildStretchedBuffer(decodedBufferRef.current!, stretches);
-      const wavBytes = encodeWav(stretched);
+      // Rust: decode original MP3, apply Rubber Band stretches, write WAV
+      await invoke("bake_audio", {
+        mp3Path,
+        stretches,
+        outputPath: savePath,
+      });
 
-      // Save to disk
-      await writeFile(savePath, wavBytes);
-
-      // Update project with baked path (triggers save-awareness)
       onBakedWavPathChange(savePath);
-
-      // Load baked WAV into WaveSurfer
       setReady(false);
       await ws.load(convertFileSrc(savePath));
-
-      // Reposition beats to their stretched time positions
       onBeatsChangeRef.current(repositionBeats(beats, stretches));
-
-      // Stretches are KEPT — they are displayed as baked overlays
     } finally {
       setRerendering(false);
     }
   }
 
-  // ── Export to WAV ──────────────────────────────────────────────────────────
+  // ── Export to MP3 — Rubber Band + ffmpeg ──────────────────────────────────
   async function handleExport() {
     if (exporting) return;
+    setExportError(null);
     const outPath = await saveDialog({
-      title: "Export as WAV",
-      filters: [{ name: "WAV Audio", extensions: ["wav"] }],
-      defaultPath: mp3Path.replace(/\.mp3$/i, "") + "_stretched.wav",
+      title: "Export as MP3",
+      filters: [{ name: "MP3 Audio", extensions: ["mp3"] }],
+      defaultPath: mp3Path.replace(/\.mp3$/i, "") + "_stretched.mp3",
     });
     if (!outPath) return;
 
     setExporting(true);
     try {
-      if (!decodedBufferRef.current) {
-        decodedBufferRef.current = await decodeAudioFile(convertFileSrc(mp3Path));
-      }
-      const processed = stretches.length > 0
-        ? await buildStretchedBuffer(decodedBufferRef.current!, stretches)
-        : decodedBufferRef.current!;
-      const wavBytes = encodeWav(processed);
-      await writeFile(outPath, wavBytes);
+      await invoke("export_mp3", { mp3Path, stretches, outputPath: outPath });
+    } catch (e) {
+      setExportError(String(e));
     } finally {
       setExporting(false);
     }
@@ -536,10 +507,7 @@ export default function WaveformEditor({
 
   function handleRateChange(rate: number) {
     setPlaybackRate(rate);
-    playbackRateRef.current = rate;
-    // Account for any currently-active stretch region
-    const factor = activeStretchFactorRef.current;
-    wsRef.current?.setPlaybackRate(rate / (factor ?? 1));
+    wsRef.current?.setPlaybackRate(rate);
   }
 
   // ── Derived display values ─────────────────────────────────────────────────
@@ -668,10 +636,13 @@ export default function WaveformEditor({
             className="transport-btn export-btn"
             onClick={handleExport}
             disabled={exporting}
-            title="Export to WAV with all stretches applied"
+            title="Export to MP3 with all stretches applied (requires ffmpeg)"
           >
-            {exporting ? "Exporting…" : "↓ Export WAV"}
+            {exporting ? "Exporting…" : "↓ Export MP3"}
           </button>
+          {exportError && (
+            <span className="export-error" title={exportError}>⚠ export failed</span>
+          )}
 
           {/* Zoom */}
           <span className="zoom-hint">Ctrl+scroll</span>

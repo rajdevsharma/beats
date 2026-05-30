@@ -1,4 +1,11 @@
-//! Real-time audio engine: cpal playback, pitch-correct stretching, position events.
+//! Real-time audio engine: cpal playback, pitch-correct time stretch + rate control.
+//!
+//! Two-layer model:
+//!   original → [user stretches via RubberBand] → warped
+//!   warped   → [global rate via RubberBand]    → playback_buf  ← cpal reads here
+//!
+//! Position is tracked as frames into playback_buf.
+//! Position events emit original-timeline seconds so the cursor stays correct.
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,29 +17,31 @@ use tauri::{AppHandle, Emitter};
 
 use super::{apply_stretches, StretchSeg};
 use super::decode::decode_audio_file;
+use super::rubberband::stretch_offline;
 
-// ── Shared state between engine methods and cpal callback ─────────────────
+// ── Shared state between engine and cpal callback ─────────────────────────
 
 struct StreamShared {
-    warped: Arc<Vec<f32>>,
+    buf: Arc<Vec<f32>>,
     channels: usize,
-    // Frame index into `warped` (not original).  Atomics allow lock-free
-    // reads from the position-event thread.
     position: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
 }
 
-// ── Main engine ────────────────────────────────────────────────────────────
+// ── Engine inner state ─────────────────────────────────────────────────────
 
 struct Inner {
     sample_rate: u32,
     channels: usize,
     original: Vec<f32>,
+    /// Original with user stretch regions applied (Rubber Band offline).
     warped: Arc<Vec<f32>>,
+    /// warped processed by global rate (1/rate time ratio). Equals warped when rate == 1.
+    playback_buf: Arc<Vec<f32>>,
     stretches: Vec<StretchSeg>,
+    playback_rate: f64,
     original_duration_secs: f64,
     warped_duration_secs: f64,
-    /// Peaks for the *warped* waveform: one Vec<f32> per channel, ~100 pts/sec.
     warped_peaks: Vec<Vec<f32>>,
 }
 
@@ -40,23 +49,24 @@ pub struct AudioEngine {
     inner: Mutex<Inner>,
     position: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
-    // Keeps the cpal stream alive while playing.
     stream: Mutex<Option<cpal::Stream>>,
 }
 
-// cpal::Stream is Send on all Tauri-supported platforms.
 unsafe impl Send for AudioEngine {}
 unsafe impl Sync for AudioEngine {}
 
 impl AudioEngine {
     pub fn new() -> Self {
+        let empty: Arc<Vec<f32>> = Arc::new(Vec::new());
         AudioEngine {
             inner: Mutex::new(Inner {
                 sample_rate: 44100,
                 channels: 2,
                 original: Vec::new(),
-                warped: Arc::new(Vec::new()),
+                warped: Arc::clone(&empty),
+                playback_buf: Arc::clone(&empty),
                 stretches: Vec::new(),
+                playback_rate: 1.0,
                 original_duration_secs: 0.0,
                 warped_duration_secs: 0.0,
                 warped_peaks: Vec::new(),
@@ -70,9 +80,8 @@ impl AudioEngine {
 
 // ── Peak extraction ────────────────────────────────────────────────────────
 
-/// Downsample interleaved PCM to per-channel peak arrays at ~100 pts/sec.
 fn compute_peaks(samples: &[f32], channels: usize, sample_rate: u32) -> Vec<Vec<f32>> {
-    let chunk = (sample_rate / 100).max(1) as usize; // ~10ms per peak
+    let chunk = (sample_rate / 100).max(1) as usize;
     let total_frames = samples.len() / channels;
     let num_peaks = (total_frames + chunk - 1) / chunk;
 
@@ -87,6 +96,19 @@ fn compute_peaks(samples: &[f32], channels: usize, sample_rate: u32) -> Vec<Vec<
         }
     }
     out
+}
+
+// ── Rate processing ────────────────────────────────────────────────────────
+
+/// Apply a global playback rate to an already-warped buffer.
+/// rate = 0.75 → time_ratio = 1/0.75 ≈ 1.333 (slower, pitch-correct via RubberBand).
+fn apply_rate(warped: &[f32], channels: usize, sample_rate: u32, rate: f64) -> Arc<Vec<f32>> {
+    if (rate - 1.0).abs() < 1e-6 || warped.is_empty() {
+        // No processing needed — share the warped buffer directly
+        return Arc::new(warped.to_vec());
+    }
+    let time_ratio = 1.0 / rate;
+    Arc::new(stretch_offline(warped, channels, sample_rate, time_ratio))
 }
 
 // ── Warp-time mapping ─────────────────────────────────────────────────────
@@ -142,6 +164,29 @@ fn warped_frame_to_original_secs(frame: usize, stretches: &[StretchSeg], sr: u32
     orig_cursor + (frame - warp_cursor) as f64 / sr_f
 }
 
+/// Convert playback_buf frame → original seconds (accounts for both rate and stretches).
+fn playback_frame_to_original_secs(
+    pb_frame: usize,
+    stretches: &[StretchSeg],
+    sample_rate: u32,
+    rate: f64,
+) -> f64 {
+    // playback_buf is warped stretched by 1/rate → playback_buf_frame * rate = warped_frame
+    let warped_frame = (pb_frame as f64 * rate) as usize;
+    warped_frame_to_original_secs(warped_frame, stretches, sample_rate)
+}
+
+/// Convert original seconds → playback_buf frame.
+fn original_secs_to_playback_frame(
+    t: f64,
+    stretches: &[StretchSeg],
+    sample_rate: u32,
+    rate: f64,
+) -> usize {
+    let warped_frame = original_secs_to_warped_frame(t, stretches, sample_rate);
+    (warped_frame as f64 / rate) as usize
+}
+
 // ── cpal stream factory ───────────────────────────────────────────────────
 
 fn build_stream(shared: Arc<StreamShared>, sample_rate: u32, channels: usize) -> Result<cpal::Stream, String> {
@@ -165,15 +210,15 @@ fn build_stream(shared: Arc<StreamShared>, sample_rate: u32, channels: usize) ->
                     return;
                 }
                 let frame = shared.position.load(Ordering::Relaxed) as usize;
-                let start_sample = frame * shared.channels;
-                let w = &shared.warped;
-                let available = w.len().saturating_sub(start_sample);
+                let start = frame * shared.channels;
+                let buf = &shared.buf;
+                let available = buf.len().saturating_sub(start);
                 let to_copy = data.len().min(available);
-                data[..to_copy].copy_from_slice(&w[start_sample..start_sample + to_copy]);
+                data[..to_copy].copy_from_slice(&buf[start..start + to_copy]);
                 data[to_copy..].fill(0.0);
                 let new_frame = frame + to_copy / shared.channels;
                 shared.position.store(new_frame as u64, Ordering::Relaxed);
-                if new_frame * shared.channels >= w.len() {
+                if new_frame * shared.channels >= buf.len() {
                     shared.is_playing.store(false, Ordering::Relaxed);
                 }
             },
@@ -188,26 +233,24 @@ fn build_stream(shared: Arc<StreamShared>, sample_rate: u32, channels: usize) ->
 
 // ── Position event loop ───────────────────────────────────────────────────
 
-/// Spawns a task that emits `audio-position` events at ~60fps while playing.
-/// Emits one final event with `playing: false` when playback stops.
 pub fn spawn_position_emitter(
     app: AppHandle,
     position: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
     stretches: Vec<StretchSeg>,
     sample_rate: u32,
+    rate: f64,
 ) {
     tokio::spawn(async move {
         let mut was_playing = true;
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
             let playing = is_playing.load(Ordering::Relaxed);
-            let frame = position.load(Ordering::Relaxed) as usize;
-            let t = warped_frame_to_original_secs(frame, &stretches, sample_rate);
+            let pb_frame = position.load(Ordering::Relaxed) as usize;
+            let t = playback_frame_to_original_secs(pb_frame, &stretches, sample_rate, rate);
             let _ = app.emit("audio-position", PositionEvent { t, playing });
             if !playing {
                 if was_playing {
-                    // One more event to confirm stop
                     was_playing = false;
                 } else {
                     break;
@@ -253,19 +296,21 @@ pub async fn load_audio(
         let decoded = decode_audio_file(&path)?;
         let peaks = compute_peaks(&decoded.samples, decoded.channels, decoded.sample_rate);
         let warped = Arc::new(decoded.samples.clone());
-        let warped_duration = decoded.duration_secs;
-        let mut inner = eng.inner.lock().unwrap();
-        inner.sample_rate = decoded.sample_rate;
-        inner.channels = decoded.channels;
-        inner.original = decoded.samples;
-        inner.warped = Arc::clone(&warped);
-        inner.stretches = Vec::new();
-        inner.original_duration_secs = decoded.duration_secs;
-        inner.warped_duration_secs = warped_duration;
-        inner.warped_peaks = peaks.clone();
+        {
+            let mut inner = eng.inner.lock().unwrap();
+            inner.sample_rate = decoded.sample_rate;
+            inner.channels = decoded.channels;
+            inner.original = decoded.samples;
+            inner.warped = Arc::clone(&warped);
+            inner.playback_buf = Arc::clone(&warped); // rate=1 on load
+            inner.playback_rate = 1.0;
+            inner.stretches = Vec::new();
+            inner.original_duration_secs = decoded.duration_secs;
+            inner.warped_duration_secs = decoded.duration_secs;
+            inner.warped_peaks = peaks.clone();
+        }
         eng.position.store(0, Ordering::Relaxed);
         eng.is_playing.store(false, Ordering::Relaxed);
-        // Drop any existing stream
         drop(eng.stream.lock().unwrap().take());
 
         Ok(LoadResult {
@@ -286,9 +331,9 @@ pub async fn set_stretches_audio(
 ) -> Result<SetStretchesResult, String> {
     let eng = Arc::clone(&engine);
     tokio::task::spawn_blocking(move || {
-        let (original, sample_rate, channels) = {
+        let (original, sample_rate, channels, rate) = {
             let inner = eng.inner.lock().unwrap();
-            (inner.original.clone(), inner.sample_rate, inner.channels)
+            (inner.original.clone(), inner.sample_rate, inner.channels, inner.playback_rate)
         };
         if original.is_empty() {
             return Err("no audio loaded".to_string());
@@ -298,27 +343,28 @@ pub async fn set_stretches_audio(
         let new_warped_frames = new_warped.len() / channels;
         let new_warped_duration = new_warped_frames as f64 / sample_rate as f64;
         let peaks = compute_peaks(&new_warped, channels, sample_rate);
+        let new_playback = apply_rate(&new_warped, channels, sample_rate, rate);
         let new_warped = Arc::new(new_warped);
 
-        // Remap current position to new warped space
-        let old_frame = eng.position.load(Ordering::Relaxed) as usize;
+        // Remap current position into new playback_buf space
+        let old_pb_frame = eng.position.load(Ordering::Relaxed) as usize;
         let mut inner = eng.inner.lock().unwrap();
-        let old_orig_t = warped_frame_to_original_secs(old_frame, &inner.stretches, sample_rate);
-        let new_frame = original_secs_to_warped_frame(old_orig_t, &stretches, sample_rate);
+        let old_orig_t = playback_frame_to_original_secs(old_pb_frame, &inner.stretches, sample_rate, inner.playback_rate);
+        let new_pb_frame = original_secs_to_playback_frame(old_orig_t, &stretches, sample_rate, rate);
+
         inner.stretches = stretches;
         inner.warped = Arc::clone(&new_warped);
+        inner.playback_buf = Arc::clone(&new_playback);
         inner.warped_duration_secs = new_warped_duration;
         inner.warped_peaks = peaks.clone();
-        eng.position.store(new_frame as u64, Ordering::Relaxed);
+        eng.position.store(new_pb_frame as u64, Ordering::Relaxed);
 
-        // If playing, rebuild the stream with the new warped buffer
         let was_playing = eng.is_playing.load(Ordering::Relaxed);
         if was_playing {
             eng.is_playing.store(false, Ordering::Relaxed);
             drop(eng.stream.lock().unwrap().take());
-
             let shared = Arc::new(StreamShared {
-                warped: new_warped,
+                buf: new_playback,
                 channels,
                 position: Arc::clone(&eng.position),
                 is_playing: Arc::clone(&eng.is_playing),
@@ -339,6 +385,75 @@ pub async fn set_stretches_audio(
 }
 
 #[tauri::command]
+pub async fn set_playback_rate(
+    rate: f64,
+    app: AppHandle,
+    engine: tauri::State<'_, Arc<AudioEngine>>,
+) -> Result<(), String> {
+    let rate = rate.clamp(0.1, 2.0);
+    let eng = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        let (warped, channels, sample_rate, stretches) = {
+            let inner = eng.inner.lock().unwrap();
+            if (inner.playback_rate - rate).abs() < 1e-6 {
+                return Ok(()); // nothing to do
+            }
+            (
+                inner.warped.as_ref().clone(),
+                inner.channels,
+                inner.sample_rate,
+                inner.stretches.clone(),
+            )
+        };
+        if warped.is_empty() {
+            return Err("no audio loaded".to_string());
+        }
+
+        let new_playback = apply_rate(&warped, channels, sample_rate, rate);
+
+        // Remap position
+        let old_pb_frame = eng.position.load(Ordering::Relaxed) as usize;
+        let mut inner = eng.inner.lock().unwrap();
+        let orig_t = playback_frame_to_original_secs(old_pb_frame, &stretches, sample_rate, inner.playback_rate);
+        let new_pb_frame = original_secs_to_playback_frame(orig_t, &stretches, sample_rate, rate);
+
+        inner.playback_rate = rate;
+        inner.playback_buf = Arc::clone(&new_playback);
+        eng.position.store(new_pb_frame as u64, Ordering::Relaxed);
+
+        let was_playing = eng.is_playing.load(Ordering::Relaxed);
+        if was_playing {
+            eng.is_playing.store(false, Ordering::Relaxed);
+            drop(eng.stream.lock().unwrap().take());
+            let shared = Arc::new(StreamShared {
+                buf: Arc::clone(&new_playback),
+                channels,
+                position: Arc::clone(&eng.position),
+                is_playing: Arc::clone(&eng.is_playing),
+            });
+            match build_stream(shared, sample_rate, channels) {
+                Ok(s) => {
+                    eng.is_playing.store(true, Ordering::Relaxed);
+                    *eng.stream.lock().unwrap() = Some(s);
+                    spawn_position_emitter(
+                        app,
+                        Arc::clone(&eng.position),
+                        Arc::clone(&eng.is_playing),
+                        stretches,
+                        sample_rate,
+                        rate,
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 pub async fn play_audio(
     app: AppHandle,
     engine: tauri::State<'_, Arc<AudioEngine>>,
@@ -349,17 +464,18 @@ pub async fn play_audio(
             return Ok(());
         }
         let inner = eng.inner.lock().unwrap();
-        if inner.warped.is_empty() {
+        if inner.playback_buf.is_empty() {
             return Err("no audio loaded".to_string());
         }
-        let frame = eng.position.load(Ordering::Relaxed) as usize;
         // If at end, rewind
-        let total_frames = inner.warped.len() / inner.channels;
-        let start_frame = if frame >= total_frames { 0 } else { frame };
-        eng.position.store(start_frame as u64, Ordering::Relaxed);
+        let total_frames = inner.playback_buf.len() / inner.channels;
+        let cur = eng.position.load(Ordering::Relaxed) as usize;
+        if cur >= total_frames {
+            eng.position.store(0, Ordering::Relaxed);
+        }
 
         let shared = Arc::new(StreamShared {
-            warped: Arc::clone(&inner.warped),
+            buf: Arc::clone(&inner.playback_buf),
             channels: inner.channels,
             position: Arc::clone(&eng.position),
             is_playing: Arc::clone(&eng.is_playing),
@@ -367,13 +483,14 @@ pub async fn play_audio(
         let sample_rate = inner.sample_rate;
         let channels = inner.channels;
         let stretches = inner.stretches.clone();
+        let rate = inner.playback_rate;
         drop(inner);
 
         let stream = build_stream(shared, sample_rate, channels)?;
         eng.is_playing.store(true, Ordering::Relaxed);
         *eng.stream.lock().unwrap() = Some(stream);
 
-        spawn_position_emitter(app, Arc::clone(&eng.position), Arc::clone(&eng.is_playing), stretches, sample_rate);
+        spawn_position_emitter(app, Arc::clone(&eng.position), Arc::clone(&eng.is_playing), stretches, sample_rate, rate);
         Ok(())
     })
     .await
@@ -386,15 +503,15 @@ pub async fn pause_audio(
     engine: tauri::State<'_, Arc<AudioEngine>>,
 ) -> Result<(), String> {
     let eng = Arc::clone(&engine);
-    let (sr, stretches, frame) = {
+    let (sr, stretches, pb_frame, rate) = {
         let inner = eng.inner.lock().unwrap();
         let fr = eng.position.load(Ordering::Relaxed) as usize;
-        (inner.sample_rate, inner.stretches.clone(), fr)
+        (inner.sample_rate, inner.stretches.clone(), fr, inner.playback_rate)
     };
     eng.is_playing.store(false, Ordering::Relaxed);
     drop(eng.stream.lock().unwrap().take());
 
-    let t = warped_frame_to_original_secs(frame, &stretches, sr);
+    let t = playback_frame_to_original_secs(pb_frame, &stretches, sr, rate);
     let _ = app.emit("audio-position", PositionEvent { t, playing: false });
     Ok(())
 }
@@ -406,15 +523,14 @@ pub async fn seek_audio(
     engine: tauri::State<'_, Arc<AudioEngine>>,
 ) -> Result<(), String> {
     let eng = Arc::clone(&engine);
-    let (sr, stretches) = {
+    let (sr, stretches, rate) = {
         let inner = eng.inner.lock().unwrap();
-        (inner.sample_rate, inner.stretches.clone())
+        (inner.sample_rate, inner.stretches.clone(), inner.playback_rate)
     };
-    let frame = original_secs_to_warped_frame(t, &stretches, sr);
-    eng.position.store(frame as u64, Ordering::Relaxed);
+    let pb_frame = original_secs_to_playback_frame(t, &stretches, sr, rate);
+    eng.position.store(pb_frame as u64, Ordering::Relaxed);
 
-    // Emit position immediately so cursor moves right away
-    let actual_t = warped_frame_to_original_secs(frame, &stretches, sr);
+    let actual_t = playback_frame_to_original_secs(pb_frame, &stretches, sr, rate);
     let playing = eng.is_playing.load(Ordering::Relaxed);
     let _ = app.emit("audio-position", PositionEvent { t: actual_t, playing });
     Ok(())

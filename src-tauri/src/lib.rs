@@ -58,6 +58,7 @@ pub fn run() {
             audio::get_audio_duration,
             audio::engine::load_audio,
             audio::engine::set_stretches_audio,
+            audio::engine::set_playback_rate,
             audio::engine::play_audio,
             audio::engine::pause_audio,
             audio::engine::seek_audio,

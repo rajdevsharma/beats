@@ -87,6 +87,7 @@ export default function WaveformEditor({
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [rateProcessing, setRateProcessing] = useState(false);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
@@ -576,7 +577,10 @@ export default function WaveformEditor({
 
   function handleRateChange(rate: number) {
     setPlaybackRate(rate);
-    // Playback rate via Rust engine is coming soon
+    setRateProcessing(true);
+    invoke("set_playback_rate", { rate })
+      .catch(console.error)
+      .finally(() => setRateProcessing(false));
   }
 
   // ── Derived display values ─────────────────────────────────────────────────
@@ -650,11 +654,12 @@ export default function WaveformEditor({
             {PLAYBACK_RATES.map((r) => (
               <button
                 key={r}
-                className={`rate-btn${playbackRate === r ? " rate-btn-active" : ""}`}
+                className={`rate-btn${playbackRate === r ? " rate-btn-active" : ""}${rateProcessing && playbackRate === r ? " rate-btn-processing" : ""}`}
                 onClick={() => handleRateChange(r)}
-                title={r < 1 ? "Rate control coming soon" : undefined}
+                disabled={rateProcessing}
+                title={r < 1 ? "Pitch-correct slow practice via Rubber Band" : undefined}
               >
-                {r === 1 ? "1×" : `${r * 100}%`}
+                {rateProcessing && playbackRate === r ? "…" : r === 1 ? "1×" : `${r * 100}%`}
               </button>
             ))}
           </div>

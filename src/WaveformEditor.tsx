@@ -87,6 +87,8 @@ export default function WaveformEditor({
   const [exportError, setExportError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rateProcessing, setRateProcessing] = useState(false);
+  // PCM decode happens in background after waveform is shown
+  const [pcmReady, setPcmReady] = useState(false);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
@@ -193,6 +195,7 @@ export default function WaveformEditor({
     setLoadError(null);
     setPlaying(false);
     playingRef.current = false;
+    setPcmReady(false);
 
     (async () => {
       try {
@@ -223,12 +226,11 @@ export default function WaveformEditor({
     return () => { cancelled = true; };
   }, [mp3Path]);
 
-  // ── Listen to Rust decode-progress events ─────────────────────────────────
+  // ── Listen to Rust decode-progress and pcm-ready events ───────────────────
   useEffect(() => {
-    const unlisten = listen<number>("load-progress", (ev) => {
-      setLoadProgress(ev.payload);
-    });
-    return () => { unlisten.then(fn => fn()); };
+    const u1 = listen<number>("load-progress", (ev) => setLoadProgress(ev.payload));
+    const u2 = listen("pcm-ready", () => setPcmReady(true));
+    return () => { u1.then(fn => fn()); u2.then(fn => fn()); };
   }, []);
 
   // ── Listen to Rust position events ────────────────────────────────────────
@@ -632,13 +634,22 @@ export default function WaveformEditor({
                 key={r}
                 className={`rate-btn${playbackRate === r ? " rate-btn-active" : ""}${rateProcessing && playbackRate === r ? " rate-btn-processing" : ""}`}
                 onClick={() => handleRateChange(r)}
-                disabled={rateProcessing}
-                title={r < 1 ? "Pitch-correct slow practice via Rubber Band" : undefined}
+                disabled={rateProcessing || (!pcmReady && r !== 1)}
+                title={
+                  !pcmReady && r !== 1
+                    ? "Loading audio in background…"
+                    : r < 1 ? "Pitch-correct slow practice via Rubber Band" : undefined
+                }
               >
                 {rateProcessing && playbackRate === r ? "…" : r === 1 ? "1×" : `${r * 100}%`}
               </button>
             ))}
           </div>
+          {!pcmReady && ready && (
+            <span className="pcm-loading-hint" title="Full audio loading in background for stretch/rate">
+              ⟳ loading…
+            </span>
+          )}
 
           {/* Record */}
           <button

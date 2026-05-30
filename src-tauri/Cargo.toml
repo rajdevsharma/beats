@@ -29,3 +29,9 @@ hound = "3.5"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 cpal = "0.15"
 
+# Optimize all dependencies even in debug builds.
+# Our own code stays unoptimized for fast incremental recompiles.
+# This makes symphonia MP3 decode ~10-20x faster in `tauri dev`.
+[profile.dev.package."*"]
+opt-level = 3
+

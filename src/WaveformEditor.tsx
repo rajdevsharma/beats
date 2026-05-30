@@ -241,16 +241,10 @@ export default function WaveformEditor({
       setPlaying(p);
       playingRef.current = p;
 
-      // Only drive the WaveSurfer cursor during active playback.
-      // When paused, explicit seeks go through handleSeek() which calls
-      // ws.seekTo() directly — no round-trip needed, and this guards
-      // against stale position=0 events snapping the cursor back.
-      if (p) {
-        const ws = wsRef.current;
-        const dur = durationRef.current;
-        if (ws && dur > 0) {
-          ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
-        }
+      const ws = wsRef.current;
+      const dur = durationRef.current;
+      if (ws && dur > 0) {
+        ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
       }
     });
     return () => { unlisten.then(fn => fn()); };

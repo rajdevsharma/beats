@@ -152,8 +152,7 @@ export default function WaveformEditor({
         return;
       }
 
-      // Seek Rust engine to clicked position
-      invoke("seek_audio", { t }).catch(console.error);
+      handleSeek(t);
 
       if (shiftHeldRef.current) {
         const updated = [...beatsRef.current, t].sort((a, b) => a - b);
@@ -242,11 +241,16 @@ export default function WaveformEditor({
       setPlaying(p);
       playingRef.current = p;
 
-      // Drive WaveSurfer cursor
-      const ws = wsRef.current;
-      const dur = durationRef.current;
-      if (ws && dur > 0) {
-        ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
+      // Only drive the WaveSurfer cursor during active playback.
+      // When paused, explicit seeks go through handleSeek() which calls
+      // ws.seekTo() directly — no round-trip needed, and this guards
+      // against stale position=0 events snapping the cursor back.
+      if (p) {
+        const ws = wsRef.current;
+        const dur = durationRef.current;
+        if (ws && dur > 0) {
+          ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
+        }
       }
     });
     return () => { unlisten.then(fn => fn()); };
@@ -346,6 +350,17 @@ export default function WaveformEditor({
       window.removeEventListener("keyup", onKeyUp);
     };
   }, []);
+
+  // ── Seek helper ───────────────────────────────────────────────────────────
+  // Updates WaveSurfer cursor immediately (no round-trip) AND notifies Rust.
+  function handleSeek(t: number) {
+    const ws = wsRef.current;
+    const dur = durationRef.current;
+    if (ws && dur > 0) {
+      ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
+    }
+    invoke("seek_audio", { t }).catch(console.error);
+  }
 
   // ── Playback helpers ───────────────────────────────────────────────────────
   function togglePlayPause() {
@@ -612,7 +627,7 @@ export default function WaveformEditor({
           {/* Playback */}
           <button
             className="transport-btn"
-            onClick={() => invoke("seek_audio", { t: 0 }).catch(console.error)}
+            onClick={() => handleSeek(0)}
             title="Skip to start"
           >⏮</button>
           <button
@@ -645,11 +660,6 @@ export default function WaveformEditor({
               </button>
             ))}
           </div>
-          {!pcmReady && ready && (
-            <span className="pcm-loading-hint" title="Full audio loading in background for stretch/rate">
-              ⟳ loading…
-            </span>
-          )}
 
           {/* Record */}
           <button

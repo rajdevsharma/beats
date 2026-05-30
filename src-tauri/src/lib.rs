@@ -1,7 +1,9 @@
 mod audio;
 
+use audio::AudioEngine;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct StretchSegment {
@@ -44,6 +46,7 @@ fn load_project(path: String) -> Result<BeatsProject, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(Arc::new(AudioEngine::new()))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -53,6 +56,11 @@ pub fn run() {
             audio::bake_audio,
             audio::export_mp3,
             audio::get_audio_duration,
+            audio::engine::load_audio,
+            audio::engine::set_stretches_audio,
+            audio::engine::play_audio,
+            audio::engine::pause_audio,
+            audio::engine::seek_audio,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

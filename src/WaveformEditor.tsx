@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import WaveSurfer from "wavesurfer.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
 import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
@@ -25,6 +25,10 @@ function formatTime(seconds: number): string {
   const cs = Math.floor((seconds % 1) * 10);
   return `${m}:${String(s).padStart(2, "0")}.${cs}`;
 }
+
+interface PositionEvent { t: number; playing: boolean; }
+interface LoadResult { peaks: number[][]; duration: number; sample_rate: number; channels: number; }
+interface SetStretchesResult { peaks: number[][]; warped_duration: number; }
 
 const ZOOM_STEP = 1.5;
 const ZOOM_MAX_MULTIPLIER = 500;
@@ -62,8 +66,9 @@ export default function WaveformEditor({
   const stretchModeRef = useRef(false);
   const stretchAnchorRef = useRef<number | null>(null);
   const regionJustClickedRef = useRef(false);
-  // Latest bakedWavPath for use inside the WaveSurfer creation effect
-  const bakedWavPathRef = useRef(bakedWavPath);
+  const durationRef = useRef(0);
+  const currentTimeRef = useRef(0);
+  const playingRef = useRef(false);
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
@@ -81,6 +86,7 @@ export default function WaveformEditor({
   const [rerendering, setRerendering] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; }, [beats]);
@@ -90,9 +96,11 @@ export default function WaveformEditor({
   useEffect(() => { selectedBeatTimeRef.current = selectedBeatTime; }, [selectedBeatTime]);
   useEffect(() => { stretchModeRef.current = stretchMode; }, [stretchMode]);
   useEffect(() => { stretchAnchorRef.current = stretchAnchor; }, [stretchAnchor]);
-  useEffect(() => { bakedWavPathRef.current = bakedWavPath; }, [bakedWavPath]);
+  useEffect(() => { durationRef.current = duration; }, [duration]);
+  useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
+  useEffect(() => { playingRef.current = playing; }, [playing]);
 
-  // ── WaveSurfer + Regions creation ──────────────────────────────────────────
+  // ── WaveSurfer creation (display only — Rust drives audio) ────────────────
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -116,50 +124,35 @@ export default function WaveformEditor({
       ],
     });
 
-    ws.on("loading", (pct) => setLoadProgress(pct));
     ws.on("ready", (dur) => {
       setReady(true);
-      setDuration(dur);
       const fit = containerRef.current!.clientWidth / dur;
       fitPxPerSecRef.current = fit;
       zoomPxPerSecRef.current = fit;
       setZoomPxPerSec(fit);
-    });
-    ws.on("play", () => setPlaying(true));
-    ws.on("pause", () => {
-      setPlaying(false);
-      if (recordingRef.current) stopRecording(ws);
-    });
-    ws.on("timeupdate", (t) => setCurrentTime(t));
-    ws.on("finish", () => {
-      setPlaying(false);
-      if (recordingRef.current) stopRecording(ws);
+      setLoadProgress(100);
     });
 
     ws.on("interaction", () => {
-      // Ignore if the click landed on a region element
       if (regionJustClickedRef.current) return;
-
       const t = ws.getCurrentTime();
 
       if (stretchModeRef.current) {
         if (shiftHeldRef.current && stretchAnchorRef.current !== null) {
-          // Second point → open modal
           const a = stretchAnchorRef.current;
           const start = Math.min(a, t);
           const end = Math.max(a, t);
-          if (end - start > 0.01) {
-            setStretchModal({ start, end });
-          }
+          if (end - start > 0.01) setStretchModal({ start, end });
         } else if (!shiftHeldRef.current) {
-          // First point → set anchor
           stretchAnchorRef.current = t;
           setStretchAnchor(t);
         }
         return;
       }
 
-      // Normal mode: shift+click adds a beat
+      // Seek Rust engine to clicked position
+      invoke("seek_audio", { t }).catch(console.error);
+
       if (shiftHeldRef.current) {
         const updated = [...beatsRef.current, t].sort((a, b) => a - b);
         onBeatsChangeRef.current(updated);
@@ -181,10 +174,6 @@ export default function WaveformEditor({
     }
     containerRef.current.addEventListener("wheel", onWheel, { passive: false });
 
-    const initialSrc = bakedWavPathRef.current
-      ? convertFileSrc(bakedWavPathRef.current)
-      : convertFileSrc(mp3Path);
-    ws.load(initialSrc);
     wsRef.current = ws;
 
     return () => {
@@ -195,6 +184,95 @@ export default function WaveformEditor({
     };
   }, [mp3Path]);
 
+  // ── Load audio via Rust engine ─────────────────────────────────────────────
+  useEffect(() => {
+    if (!mp3Path) return;
+    let cancelled = false;
+    setReady(false);
+    setLoadProgress(0);
+    setLoadError(null);
+    setPlaying(false);
+    playingRef.current = false;
+
+    (async () => {
+      try {
+        setLoadProgress(5);
+        const result = await invoke<LoadResult>("load_audio", { path: mp3Path });
+        if (cancelled) return;
+        setLoadProgress(80);
+        setDuration(result.duration);
+        durationRef.current = result.duration;
+
+        const ws = wsRef.current;
+        if (!ws) return;
+
+        // If the project already has stretches, apply them immediately so the
+        // warped waveform is shown (avoids a second load cycle after ready).
+        let peaksToUse = result.peaks;
+        let durToUse = result.duration;
+        if (stretchesRef.current.length > 0) {
+          try {
+            const sr = await invoke<SetStretchesResult>("set_stretches_audio", {
+              stretches: stretchesRef.current,
+            });
+            peaksToUse = sr.peaks;
+            durToUse = sr.warped_duration;
+          } catch {
+            // Non-fatal: fall back to original peaks
+          }
+        }
+
+        const channelData = peaksToUse.map(ch => new Float32Array(ch));
+        await ws.load("", channelData, durToUse);
+      } catch (e) {
+        if (!cancelled) setLoadError(String(e));
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [mp3Path]);
+
+  // ── Listen to Rust position events ────────────────────────────────────────
+  useEffect(() => {
+    const unlisten = listen<PositionEvent>("audio-position", (ev) => {
+      const { t, playing: p } = ev.payload;
+      setCurrentTime(t);
+      currentTimeRef.current = t;
+      setPlaying(p);
+      playingRef.current = p;
+
+      // Drive WaveSurfer cursor
+      const ws = wsRef.current;
+      const dur = durationRef.current;
+      if (ws && dur > 0) {
+        ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
+  // ── Stretches → Rust engine sync (also rebuilds warped waveform) ──────────
+  useEffect(() => {
+    if (!ready) return;
+    const savedZoom = zoomPxPerSecRef.current;
+    invoke<SetStretchesResult>("set_stretches_audio", { stretches })
+      .then((result) => {
+        const ws = wsRef.current;
+        if (!ws) return;
+        const channelData = result.peaks.map(ch => new Float32Array(ch));
+        // After reload, restore zoom so the view doesn't jump back to Fit.
+        ws.load("", channelData, result.warped_duration).then(() => {
+          if (savedZoom > fitPxPerSecRef.current) {
+            ws.zoom(savedZoom);
+            zoomPxPerSecRef.current = savedZoom;
+            setZoomPxPerSec(savedZoom);
+          }
+        });
+      })
+      .catch(console.error);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stretches]);
+
   // ── Keyboard handlers ──────────────────────────────────────────────────────
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -204,21 +282,18 @@ export default function WaveformEditor({
       if (e.key === "Shift") { shiftHeldRef.current = true; return; }
       if (isInput) return;
 
-      // Cmd+R → re-render waveform with stretches baked in
       if (e.code === "KeyR" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         rerenderWaveform();
         return;
       }
 
-      // Space → play/pause
       if (e.code === "Space") {
         e.preventDefault();
-        wsRef.current?.playPause();
+        togglePlayPause();
         return;
       }
 
-      // Escape → cancel stretch anchor / exit stretch mode
       if (e.code === "Escape") {
         if (stretchAnchorRef.current !== null) {
           stretchAnchorRef.current = null;
@@ -230,23 +305,18 @@ export default function WaveformEditor({
         return;
       }
 
-      // T → toggle stretch mode
       if (e.code === "KeyT") {
         e.preventDefault();
         const next = !stretchModeRef.current;
         stretchModeRef.current = next;
         setStretchMode(next);
-        if (!next) {
-          stretchAnchorRef.current = null;
-          setStretchAnchor(null);
-        }
+        if (!next) { stretchAnchorRef.current = null; setStretchAnchor(null); }
         return;
       }
 
-      // S → open stretch modal using anchor → current cursor
       if (e.code === "KeyS" && stretchModeRef.current && stretchAnchorRef.current !== null) {
         e.preventDefault();
-        const t = wsRef.current?.getCurrentTime() ?? 0;
+        const t = currentTimeRef.current;
         const a = stretchAnchorRef.current;
         const start = Math.min(a, t);
         const end = Math.max(a, t);
@@ -254,23 +324,19 @@ export default function WaveformEditor({
         return;
       }
 
-      // R → toggle beat recording
       if (e.code === "KeyR") {
         e.preventDefault();
-        if (recordingRef.current) stopRecording(wsRef.current!);
+        if (recordingRef.current) stopRecording();
         else startRecording();
         return;
       }
 
-      // B → tap beat while recording
       if (e.code === "KeyB" && recordingRef.current) {
         e.preventDefault();
-        const t = wsRef.current?.getCurrentTime();
-        if (t !== undefined) pendingTapsRef.current.push(t);
+        pendingTapsRef.current.push(currentTimeRef.current);
         return;
       }
 
-      // Delete / Backspace → remove selected beat
       if ((e.code === "Delete" || e.code === "Backspace") && selectedBeatTimeRef.current !== null) {
         e.preventDefault();
         const sel = selectedBeatTimeRef.current;
@@ -294,36 +360,42 @@ export default function WaveformEditor({
     };
   }, []);
 
+  // ── Playback helpers ───────────────────────────────────────────────────────
+  function togglePlayPause() {
+    if (playingRef.current) {
+      invoke("pause_audio").catch(console.error);
+    } else {
+      invoke("play_audio").catch(console.error);
+    }
+  }
+
   // ── Recording helpers ──────────────────────────────────────────────────────
   function startRecording() {
-    const ws = wsRef.current;
-    if (!ws) return;
-    recordingStartTimeRef.current = ws.getCurrentTime();
+    recordingStartTimeRef.current = currentTimeRef.current;
     pendingTapsRef.current = [];
     recordingRef.current = true;
     setRecording(true);
-    if (!ws.isPlaying()) ws.play();
+    if (!playingRef.current) invoke("play_audio").catch(console.error);
   }
 
-  function stopRecording(ws: WaveSurfer) {
+  function stopRecording() {
     recordingRef.current = false;
     setRecording(false);
     const startTime = recordingStartTimeRef.current;
-    const endTime = ws.getCurrentTime();
+    const endTime = currentTimeRef.current;
     const taps = pendingTapsRef.current;
     pendingTapsRef.current = [];
     const kept = beatsRef.current.filter(t => t < startTime || t > endTime);
     const merged = [...kept, ...taps].sort((a, b) => a - b);
     onBeatsChangeRef.current(merged);
+    if (playingRef.current) invoke("pause_audio").catch(console.error);
   }
 
-  // ── Bake (Cmd+R) — Rubber Band offline, pitch-correct ─────────────────────
+  // ── Bake (Cmd+R) ──────────────────────────────────────────────────────────
   async function rerenderWaveform() {
-    const ws = wsRef.current;
-    if (!ws || rerendering || stretches.length === 0) return;
+    if (rerendering || stretches.length === 0) return;
 
-    // First bake: prompt for save path. Re-bake: silently overwrite.
-    let savePath = bakedWavPathRef.current;
+    let savePath = bakedWavPath;
     if (!savePath) {
       savePath = await saveDialog({
         title: "Save Baked Audio (WAV)",
@@ -334,25 +406,27 @@ export default function WaveformEditor({
     }
 
     setRerendering(true);
-    ws.pause();
+    if (playingRef.current) await invoke("pause_audio");
     try {
-      // Rust: decode original MP3, apply Rubber Band stretches, write WAV
-      await invoke("bake_audio", {
-        mp3Path,
-        stretches,
-        outputPath: savePath,
-      });
-
+      await invoke("bake_audio", { mp3Path, stretches, outputPath: savePath });
       onBakedWavPathChange(savePath);
-      setReady(false);
-      await ws.load(convertFileSrc(savePath));
+      // Reload Rust engine with the baked WAV
+      const result = await invoke<LoadResult>("load_audio", { path: savePath });
+      setDuration(result.duration);
+      durationRef.current = result.duration;
+      const ws = wsRef.current;
+      if (ws) {
+        const channelData = result.peaks.map(ch => new Float32Array(ch));
+        setReady(false);
+        await ws.load("", channelData, result.duration);
+      }
       onBeatsChangeRef.current(repositionBeats(beats, stretches));
     } finally {
       setRerendering(false);
     }
   }
 
-  // ── Export to MP3 — Rubber Band + ffmpeg ──────────────────────────────────
+  // ── Export to MP3 ─────────────────────────────────────────────────────────
   async function handleExport() {
     if (exporting) return;
     setExportError(null);
@@ -377,7 +451,6 @@ export default function WaveformEditor({
   function handleStretchConfirm(factor: number) {
     if (!stretchModal) return;
     const { start, end } = stretchModal;
-    // Merge with existing, replacing any that overlap this range
     const kept = stretchesRef.current.filter(s => s.end <= start || s.start >= end);
     const updated: Stretch[] = [...kept, { start, end, factor }]
       .sort((a, b) => a.start - b.start);
@@ -387,12 +460,11 @@ export default function WaveformEditor({
     setStretchAnchor(null);
   }
 
-  // ── Beat region sync (only touches beat-* regions) ────────────────────────
+  // ── Beat region sync ───────────────────────────────────────────────────────
   useEffect(() => {
     const rp = regionsRef.current;
     if (!rp || !ready) return;
 
-    // Remove only beat regions, leaving anchor/stretch regions intact
     rp.getRegions().filter(r => r.id.startsWith("beat-")).forEach(r => r.remove());
 
     beats.forEach((t, i) => {
@@ -463,10 +535,7 @@ export default function WaveformEditor({
     stretches.forEach((s, i) => {
       const pct = Math.round((s.factor - 1) * 100);
 
-      // When showing baked WAV, map overlay coordinates to baked time
-      const displayStart = isBaked
-        ? originalToStretched(s.start, stretches)
-        : s.start;
+      const displayStart = isBaked ? originalToStretched(s.start, stretches) : s.start;
       const displayEnd = isBaked
         ? displayStart + (s.end - s.start) * s.factor
         : s.end;
@@ -482,10 +551,10 @@ export default function WaveformEditor({
         start: displayStart,
         end: displayEnd,
         color: isBaked
-          ? "rgba(148, 163, 184, 0.10)"   // muted slate — baked
+          ? "rgba(148, 163, 184, 0.10)"
           : s.factor >= 1
-            ? "rgba(34, 197, 94, 0.12)"   // green — live slow
-            : "rgba(239, 68, 68, 0.12)",  // red — live fast
+            ? "rgba(34, 197, 94, 0.12)"
+            : "rgba(239, 68, 68, 0.12)",
         drag: false,
         resize: false,
         content: label,
@@ -507,7 +576,7 @@ export default function WaveformEditor({
 
   function handleRateChange(rate: number) {
     setPlaybackRate(rate);
-    wsRef.current?.setPlaybackRate(rate);
+    // Playback rate via Rust engine is coming soon
   }
 
   // ── Derived display values ─────────────────────────────────────────────────
@@ -525,13 +594,18 @@ export default function WaveformEditor({
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="waveform-editor">
-      {!ready && (
+      {loadError && (
+        <div className="waveform-error">
+          Failed to load audio: {loadError}
+        </div>
+      )}
+      {!ready && !loadError && (
         <div className="waveform-loading">
           <div className="waveform-loading-bar">
             <div className="waveform-loading-fill" style={{ width: `${loadProgress}%` }} />
           </div>
           <span className="waveform-loading-label">
-            {loadProgress < 100 ? `Loading ${loadProgress}%` : "Rendering…"}
+            {loadProgress < 80 ? "Decoding…" : loadProgress < 100 ? "Loading waveform…" : "Rendering…"}
           </span>
         </div>
       )}
@@ -554,10 +628,14 @@ export default function WaveformEditor({
         ].filter(Boolean).join(" ")}>
 
           {/* Playback */}
-          <button className="transport-btn" onClick={() => wsRef.current?.seekTo(0)} title="Skip to start">⏮</button>
+          <button
+            className="transport-btn"
+            onClick={() => invoke("seek_audio", { t: 0 }).catch(console.error)}
+            title="Skip to start"
+          >⏮</button>
           <button
             className="transport-btn transport-play"
-            onClick={() => wsRef.current?.playPause()}
+            onClick={togglePlayPause}
             title={playing ? "Pause (Space)" : "Play (Space)"}
           >
             {playing ? "⏸" : "▶"}
@@ -574,7 +652,7 @@ export default function WaveformEditor({
                 key={r}
                 className={`rate-btn${playbackRate === r ? " rate-btn-active" : ""}`}
                 onClick={() => handleRateChange(r)}
-                title={r < 1 ? "Pitch shifts at non-1× speeds" : undefined}
+                title={r < 1 ? "Rate control coming soon" : undefined}
               >
                 {r === 1 ? "1×" : `${r * 100}%`}
               </button>
@@ -584,7 +662,7 @@ export default function WaveformEditor({
           {/* Record */}
           <button
             className={`transport-btn record-btn${recording ? " record-btn-active" : ""}`}
-            onClick={() => recording ? stopRecording(wsRef.current!) : startRecording()}
+            onClick={() => recording ? stopRecording() : startRecording()}
             title={recording ? "Stop recording (R)" : "Record beats (R), tap B on each beat"}
           >
             {recording ? "■ Stop" : "● Rec"}
@@ -624,7 +702,7 @@ export default function WaveformEditor({
                 disabled={rerendering}
                 title={bakedWavPath
                   ? "Re-bake: reprocess original MP3 with current stretches (Cmd+R)"
-                  : "Bake: save stretched audio to WAV, load into waveform (Cmd+R)"}
+                  : "Bake: save high-quality stretched WAV (Cmd+R)"}
               >
                 {rerendering ? "Rendering…" : bakedWavPath ? "⌘R Re-bake" : "⌘R Bake"}
               </button>

@@ -54,6 +54,10 @@ pub struct AudioEngine {
     position: Arc<AtomicU64>,
     is_playing: Arc<AtomicBool>,
     stream: Mutex<Option<cpal::Stream>>,
+    /// Signals when the background PCM decode is done. Receivers can await
+    /// `changed()` to be woken up without polling or re-decoding.
+    pcm_tx: tokio::sync::watch::Sender<bool>,
+    pub pcm_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 unsafe impl Send for AudioEngine {}
@@ -62,6 +66,7 @@ unsafe impl Sync for AudioEngine {}
 impl AudioEngine {
     pub fn new() -> Self {
         let empty: Arc<Vec<f32>> = Arc::new(Vec::new());
+        let (pcm_tx, pcm_rx) = tokio::sync::watch::channel(false);
         AudioEngine {
             inner: Mutex::new(Inner {
                 sample_rate: 44100,
@@ -80,6 +85,8 @@ impl AudioEngine {
             position: Arc::new(AtomicU64::new(0)),
             is_playing: Arc::new(AtomicBool::new(false)),
             stream: Mutex::new(None),
+            pcm_tx,
+            pcm_rx,
         }
     }
 }
@@ -316,6 +323,9 @@ pub async fn load_audio(
     .await
     .map_err(|e| e.to_string())??;
 
+    // Reset PCM-ready signal for this new file.
+    eng.pcm_tx.send(false).ok();
+
     // Store metadata immediately so the UI can show the waveform.
     {
         let empty = Arc::new(Vec::<f32>::new());
@@ -343,9 +353,9 @@ pub async fn load_audio(
         channels: meta.channels,
     };
 
-    // Phase 2: decode full PCM in the background for stretch/rate processing.
-    // Play at 1× with no stretches works via streaming (below), so this is
-    // only needed when the user defines stretches or changes rate.
+    // Phase 2: decode full PCM in the background.
+    // Signals pcm_tx(true) when done so play_audio/set_stretches_audio
+    // can await instead of re-decoding.
     let eng3 = Arc::clone(&eng);
     let app3 = app.clone();
     tokio::task::spawn_blocking(move || {
@@ -353,33 +363,33 @@ pub async fn load_audio(
         let original = Arc::new(decoded.samples);
         {
             let mut inner = eng3.inner.lock().unwrap();
-            // Only apply if the same file is still loaded (user hasn't switched).
-            if inner.source_path == path {
-                inner.original = Arc::clone(&original);
-                inner.warped = Arc::clone(&original);
-                inner.playback_buf = Arc::clone(&original);
-                inner.pcm_ready = true;
-                // If pending stretches exist, rebuild warped now.
-                if !inner.stretches.is_empty() {
-                    let sr = inner.sample_rate;
-                    let ch = inner.channels;
-                    let segs = inner.stretches.clone();
-                    let rate = inner.playback_rate;
-                    drop(inner); // release lock before heavy processing
-                    let new_warped = apply_stretches(&original, ch, sr, &segs);
-                    let new_warped = Arc::new(new_warped);
-                    let new_pb = apply_rate(&new_warped, ch, sr, rate);
-                    let mut inner2 = eng3.inner.lock().unwrap();
-                    if inner2.source_path == path {
-                        inner2.warped = Arc::clone(&new_warped);
-                        inner2.playback_buf = new_pb;
-                        let _ = app3.emit("pcm-ready", ());
-                    }
-                } else {
-                    let _ = app3.emit("pcm-ready", ());
+            if inner.source_path != path {
+                return Ok(()); // user switched files, discard
+            }
+            inner.original = Arc::clone(&original);
+            inner.warped = Arc::clone(&original);
+            inner.playback_buf = Arc::clone(&original);
+            inner.pcm_ready = true;
+
+            // If stretches were defined before PCM was ready, apply them now.
+            if !inner.stretches.is_empty() {
+                let sr = inner.sample_rate;
+                let ch = inner.channels;
+                let segs = inner.stretches.clone();
+                let rate = inner.playback_rate;
+                drop(inner);
+                let new_warped = Arc::new(apply_stretches(&original, ch, sr, &segs));
+                let new_pb = apply_rate(&new_warped, ch, sr, rate);
+                let mut g = eng3.inner.lock().unwrap();
+                if g.source_path == path {
+                    g.warped = Arc::clone(&new_warped);
+                    g.playback_buf = new_pb;
                 }
             }
         }
+        // Signal play_audio / set_stretches_audio that PCM is ready.
+        eng3.pcm_tx.send(true).ok();
+        let _ = app3.emit("pcm-ready", ());
         Ok::<(), String>(())
     });
 
@@ -391,15 +401,22 @@ pub async fn set_stretches_audio(
     stretches: Vec<StretchSeg>,
     engine: tauri::State<'_, Arc<AudioEngine>>,
 ) -> Result<SetStretchesResult, String> {
+    // Wait for PCM if needed (same pattern as play_audio).
+    if !*engine.pcm_rx.borrow() {
+        let mut rx = engine.pcm_rx.clone();
+        rx.wait_for(|v| *v)
+            .await
+            .map_err(|_| "Audio loading was cancelled".to_string())?;
+    }
+
     let eng = Arc::clone(&engine);
     tokio::task::spawn_blocking(move || {
         let (original, sample_rate, channels, rate) = {
             let inner = eng.inner.lock().unwrap();
-            // Clone just the Arc pointer, not the PCM data.
             (Arc::clone(&inner.original), inner.sample_rate, inner.channels, inner.playback_rate)
         };
         if original.is_empty() {
-            return Err("Audio is still loading — please wait a moment".to_string());
+            return Err("no audio loaded".to_string());
         }
 
         let new_warped = apply_stretches(&original, channels, sample_rate, &stretches);
@@ -521,71 +538,48 @@ pub async fn play_audio(
     app: AppHandle,
     engine: tauri::State<'_, Arc<AudioEngine>>,
 ) -> Result<(), String> {
-    let eng = Arc::clone(&engine);
-    tokio::task::spawn_blocking(move || {
-        if eng.is_playing.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let inner = eng.inner.lock().unwrap();
+    if engine.is_playing.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    {
+        let inner = engine.inner.lock().unwrap();
         if inner.source_path.is_empty() {
             return Err("no audio loaded".to_string());
         }
+    }
 
+    // Wait for background PCM decode if not already done.
+    // watch::wait_for handles the "already true" case — returns immediately.
+    if !*engine.pcm_rx.borrow() {
+        let mut rx = engine.pcm_rx.clone();
+        rx.wait_for(|v| *v)
+            .await
+            .map_err(|_| "Audio loading was cancelled".to_string())?;
+    }
+
+    // PCM is ready — build the cpal stream (blocking).
+    let eng = Arc::clone(&engine);
+    tokio::task::spawn_blocking(move || {
+        let inner = eng.inner.lock().unwrap();
+        let total_frames = inner.playback_buf.len() / inner.channels;
+        let cur = eng.position.load(Ordering::Relaxed) as usize;
+        if cur >= total_frames { eng.position.store(0, Ordering::Relaxed); }
+
+        let shared = Arc::new(StreamShared {
+            buf: Arc::clone(&inner.playback_buf),
+            channels: inner.channels,
+            position: Arc::clone(&eng.position),
+            is_playing: Arc::clone(&eng.is_playing),
+        });
         let sample_rate = inner.sample_rate;
         let channels = inner.channels;
         let stretches = inner.stretches.clone();
         let rate = inner.playback_rate;
-        let source_path = inner.source_path.clone();
-
-        // If PCM is ready (or stretches/rate need it), play from the pre-built buffer.
-        // Otherwise stream-decode the original file in real time.
-        let buf = if inner.pcm_ready || !stretches.is_empty() || (rate - 1.0).abs() > 1e-6 {
-            if !inner.pcm_ready {
-                return Err("Audio is still loading — please wait a moment".to_string());
-            }
-            // If at end, rewind
-            let total_frames = inner.playback_buf.len() / channels;
-            let cur = eng.position.load(Ordering::Relaxed) as usize;
-            if cur >= total_frames { eng.position.store(0, Ordering::Relaxed); }
-            Arc::clone(&inner.playback_buf)
-        } else {
-            // Stream from file: decode into a buffer, play it.
-            // This runs synchronously here (blocking), but is fast to start
-            // because we only need the first few seconds to begin.
-            // For simplicity, decode the whole file into a temp buffer.
-            // With opt-level=3 for deps, this takes ~2-5s for a 60-min file.
-            drop(inner);
-            let decoded = decode_audio_file_with_progress(&source_path, |frac| {
-                let pct = (frac * 100.0) as u8;
-                let _ = app.emit("pcm-decode-progress", pct);
-            })?;
-            let buf = Arc::new(decoded.samples);
-
-            // Store it so subsequent plays don't re-decode.
-            let mut inner2 = eng.inner.lock().unwrap();
-            if inner2.source_path == source_path {
-                inner2.original = Arc::clone(&buf);
-                inner2.warped = Arc::clone(&buf);
-                inner2.playback_buf = Arc::clone(&buf);
-                inner2.pcm_ready = true;
-            }
-            let cur = eng.position.load(Ordering::Relaxed) as usize;
-            let total_frames = buf.len() / channels;
-            if cur >= total_frames { eng.position.store(0, Ordering::Relaxed); }
-            buf
-        };
-
-        let shared = Arc::new(StreamShared {
-            buf,
-            channels,
-            position: Arc::clone(&eng.position),
-            is_playing: Arc::clone(&eng.is_playing),
-        });
+        drop(inner);
 
         let stream = build_stream(shared, sample_rate, channels)?;
         eng.is_playing.store(true, Ordering::Relaxed);
         *eng.stream.lock().unwrap() = Some(stream);
-
         spawn_position_emitter(app, Arc::clone(&eng.position), Arc::clone(&eng.is_playing), stretches, sample_rate, rate);
         Ok(())
     })

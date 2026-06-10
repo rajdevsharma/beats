@@ -27,6 +27,10 @@ extern "C" {
 
     fn rubberband_set_time_ratio(state: RubberBandState, ratio: f64);
 
+    fn rubberband_set_expected_input_duration(state: RubberBandState, samples: u32);
+
+    fn rubberband_set_max_process_size(state: RubberBandState, samples: u32);
+
     fn rubberband_study(
         state: RubberBandState,
         input: *const *const f32,
@@ -41,6 +45,8 @@ extern "C" {
         final_block: i32,
     );
 
+    fn rubberband_get_samples_required(state: RubberBandState) -> u32;
+
     fn rubberband_available(state: RubberBandState) -> i32;
 
     fn rubberband_retrieve(
@@ -49,6 +55,8 @@ extern "C" {
         samples: u32,
     ) -> u32;
 }
+
+const CHUNK: usize = 65536;
 
 pub struct Stretcher {
     state: RubberBandState,
@@ -70,40 +78,99 @@ impl Stretcher {
         unsafe { rubberband_set_time_ratio(self.state, ratio); }
     }
 
-    /// Study the entire segment (offline mode only — improves quality).
-    pub fn study(&mut self, channels_data: &[Vec<f32>]) {
-        let ptrs: Vec<*const f32> = channels_data.iter().map(|v| v.as_ptr()).collect();
-        let frames = channels_data[0].len();
-        unsafe { rubberband_study(self.state, ptrs.as_ptr(), frames as u32, 1); }
+    pub fn set_expected_input_duration(&mut self, frames: usize) {
+        unsafe { rubberband_set_expected_input_duration(self.state, frames as u32); }
     }
 
-    /// Process the entire segment.
-    pub fn process(&mut self, channels_data: &[Vec<f32>]) {
-        let ptrs: Vec<*const f32> = channels_data.iter().map(|v| v.as_ptr()).collect();
-        let frames = channels_data[0].len();
-        unsafe { rubberband_process(self.state, ptrs.as_ptr(), frames as u32, 1); }
+    pub fn set_max_process_size(&mut self, frames: usize) {
+        unsafe { rubberband_set_max_process_size(self.state, frames as u32); }
     }
 
-    /// Drain all available output samples into interleaved Vec<f32>.
-    pub fn drain_interleaved(&mut self) -> Vec<f32> {
+    pub fn get_samples_required(&self) -> usize {
+        unsafe { rubberband_get_samples_required(self.state) as usize }
+    }
+
+    pub fn available(&self) -> i32 {
+        unsafe { rubberband_available(self.state) }
+    }
+
+    /// Feed one block of deinterleaved frames (realtime mode).
+    pub fn process_rt(&mut self, channel_data: &[&[f32]], is_final: bool) {
+        let ptrs: Vec<*const f32> = channel_data.iter().map(|s| s.as_ptr()).collect();
+        let frames = channel_data[0].len();
+        unsafe { rubberband_process(self.state, ptrs.as_ptr(), frames as u32, is_final as i32); }
+    }
+
+    /// Retrieve up to `n` frames into an interleaved output slice starting at `offset`.
+    /// Returns the number of frames actually written.
+    pub fn retrieve_interleaved(&mut self, out: &mut [f32], offset: usize, n: usize) -> usize {
         let ch = self.channels;
+        let mut bufs: Vec<Vec<f32>> = vec![vec![0f32; n]; ch];
+        let ptrs: Vec<*mut f32> = bufs.iter_mut().map(|v| v.as_mut_ptr()).collect();
+        let got = unsafe { rubberband_retrieve(self.state, ptrs.as_ptr(), n as u32) } as usize;
+        for f in 0..got {
+            for c in 0..ch {
+                out[offset + f * ch + c] = bufs[c][f];
+            }
+        }
+        got
+    }
+
+    /// Study the entire segment in chunks (offline mode only — improves quality).
+    pub fn study(&mut self, channels_data: &[Vec<f32>]) {
+        let frames = channels_data[0].len();
+        let mut offset = 0;
+        while offset < frames {
+            let end = (offset + CHUNK).min(frames);
+            let slices: Vec<Vec<f32>> = channels_data.iter()
+                .map(|ch| ch[offset..end].to_vec())
+                .collect();
+            let ptrs: Vec<*const f32> = slices.iter().map(|v| v.as_ptr()).collect();
+            unsafe {
+                rubberband_study(self.state, ptrs.as_ptr(), (end - offset) as u32, (end == frames) as i32);
+            }
+            offset = end;
+        }
+    }
+
+    /// Process the entire segment in chunks, draining after each to avoid output buffer growth.
+    pub fn process_and_drain(&mut self, channels_data: &[Vec<f32>]) -> Vec<f32> {
+        let frames = channels_data[0].len();
         let mut out = Vec::new();
+        let mut offset = 0;
+        while offset < frames {
+            let end = (offset + CHUNK).min(frames);
+            let slices: Vec<Vec<f32>> = channels_data.iter()
+                .map(|ch| ch[offset..end].to_vec())
+                .collect();
+            let ptrs: Vec<*const f32> = slices.iter().map(|v| v.as_ptr()).collect();
+            unsafe {
+                rubberband_process(self.state, ptrs.as_ptr(), (end - offset) as u32, (end == frames) as i32);
+            }
+            self.drain_into(&mut out);
+            offset = end;
+        }
+        // Final drain in case any samples are buffered after the last chunk.
+        self.drain_into(&mut out);
+        out
+    }
+
+    fn drain_into(&mut self, out: &mut Vec<f32>) {
+        let ch = self.channels;
         loop {
             let avail = unsafe { rubberband_available(self.state) };
             if avail <= 0 { break; }
-            let n = avail as usize;
+            let n = (avail as usize).min(CHUNK);
             let mut bufs: Vec<Vec<f32>> = vec![vec![0f32; n]; ch];
             let ptrs: Vec<*mut f32> = bufs.iter_mut().map(|v| v.as_mut_ptr()).collect();
             let got = unsafe {
                 rubberband_retrieve(self.state, ptrs.as_ptr(), n as u32)
             } as usize;
+            if got == 0 { break; }
             for f in 0..got {
-                for c in 0..ch {
-                    out.push(bufs[c][f]);
-                }
+                for c in 0..ch { out.push(bufs[c][f]); }
             }
         }
-        out
     }
 }
 
@@ -130,8 +197,9 @@ pub fn stretch_offline(
 
     let options = OPT_OFFLINE | OPT_ENGINE_FINER;
     let mut s = Stretcher::new(sample_rate, channels, options, time_ratio);
+    s.set_expected_input_duration(frames);
+    s.set_max_process_size(CHUNK);
 
     s.study(&channel_data);
-    s.process(&channel_data);
-    s.drain_interleaved()
+    s.process_and_drain(&channel_data)
 }

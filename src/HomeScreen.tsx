@@ -14,7 +14,7 @@ export default function HomeScreen({ onProjectOpen }: Props) {
       multiple: false,
     });
     if (typeof selected === "string") {
-      onProjectOpen({ mp3Path: selected, beats: [], stretches: [] });
+      onProjectOpen({ mp3Path: selected, beats: [], stretches: [], midiBeats: [] });
     }
   }
 
@@ -31,7 +31,7 @@ export default function HomeScreen({ onProjectOpen }: Props) {
         beatsFilePath: selected,
         beats: data.beats ?? [],
         stretches: data.stretches ?? [],
-        bakedWavPath: data.baked_wav_path,
+        midiBeats: data.midi_beats ?? [],
       });
     }
   }

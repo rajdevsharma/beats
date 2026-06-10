@@ -25,7 +25,7 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
         mp3Path: project.mp3Path,
         beats: project.beats,
         stretches: project.stretches,
-        bakedWavPath: project.bakedWavPath ?? null,
+        midiBeats: project.midiBeats,
       });
       onProjectChange({ ...project, beatsFilePath: path });
     } finally {
@@ -78,8 +78,8 @@ export default function ProjectEditor({ project, onProjectChange, onBack }: Prop
           onBeatsChange={(beats) => onProjectChange({ ...project, beats })}
           stretches={project.stretches}
           onStretchesChange={(stretches: Stretch[]) => onProjectChange({ ...project, stretches })}
-          bakedWavPath={project.bakedWavPath}
-          onBakedWavPathChange={(bakedWavPath) => onProjectChange({ ...project, bakedWavPath })}
+          midiBeats={project.midiBeats}
+          onMidiBeatsChange={(midiBeats) => onProjectChange({ ...project, midiBeats })}
         />
       </div>
     </div>

@@ -6,6 +6,8 @@ interface Props {
   beats: number[];
   onConfirm: (factor: number) => void;
   onCancel: () => void;
+  initialFactor?: number; // pre-fill when editing an existing stretch
+  onRemove?: () => void;  // present when editing an existing stretch
 }
 
 function formatTime(s: number): string {
@@ -30,9 +32,12 @@ function computeBpm(beats: number[], start: number, end: number): number | null 
   return null;
 }
 
-export default function StretchModal({ start, end, beats, onConfirm, onCancel }: Props) {
-  const [factorPct, setFactorPct] = useState("100");
+export default function StretchModal({ start, end, beats, onConfirm, onCancel, initialFactor, onRemove }: Props) {
+  const [factorPct, setFactorPct] = useState(
+    initialFactor != null ? String(Math.round(initialFactor * 100)) : "100"
+  );
   const inputRef = useRef<HTMLInputElement>(null);
+  const isEditing = onRemove != null;
 
   useEffect(() => {
     inputRef.current?.select();
@@ -65,7 +70,7 @@ export default function StretchModal({ start, end, beats, onConfirm, onCancel }:
     <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && onCancel()}>
       <div className="modal">
         <div className="modal-header">
-          <span className="modal-title">Time Stretch</span>
+          <span className="modal-title">{isEditing ? "Edit Stretch" : "Time Stretch"}</span>
           <button className="modal-close" onClick={onCancel}>✕</button>
         </div>
 
@@ -129,13 +134,18 @@ export default function StretchModal({ start, end, beats, onConfirm, onCancel }:
         </div>
 
         <div className="modal-footer">
+          {isEditing && (
+            <button className="modal-btn modal-btn-remove" onClick={onRemove}>
+              Remove
+            </button>
+          )}
           <button className="modal-btn modal-btn-cancel" onClick={onCancel}>Cancel</button>
           <button
             className="modal-btn modal-btn-confirm"
             onClick={handleConfirm}
             disabled={!isValid}
           >
-            Apply Stretch
+            {isEditing ? "Apply Changes" : "Apply Stretch"}
           </button>
         </div>
       </div>

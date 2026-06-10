@@ -2,9 +2,10 @@ pub mod decode;
 pub mod engine;
 pub mod rubberband;
 
-use decode::decode_audio_file;
+use decode::decode_audio_file_with_progress;
 use rubberband::stretch_offline;
 use serde::Deserialize;
+use tauri::Emitter;
 
 pub use engine::AudioEngine;
 
@@ -76,40 +77,67 @@ fn write_wav(samples: &[f32], channels: usize, sample_rate: u32, path: &str) -> 
 // ── Tauri commands ─────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn bake_audio(
-    mp3_path: String,
-    stretches: Vec<StretchSeg>,
-    output_path: String,
-) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        let audio = decode_audio_file(&mp3_path)?;
-        let samples = apply_stretches(&audio.samples, audio.channels, audio.sample_rate, &stretches);
-        write_wav(&samples, audio.channels, audio.sample_rate, &output_path)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
 pub async fn export_mp3(
     mp3_path: String,
     stretches: Vec<StretchSeg>,
     output_path: String,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let tmp_wav = format!("{}.tmp_export.wav", output_path);
-        let audio = decode_audio_file(&mp3_path)?;
+        let emit = |pct: u8| { let _ = app.emit("export-progress", pct); };
+
+        // Stage 1: decode (0–70 %)
+        emit(0);
+        let audio = decode_audio_file_with_progress(&mp3_path, |frac| {
+            emit((frac * 70.0) as u8);
+        })?;
+        let duration_secs = audio.duration_secs;
+
+        // Stage 2: apply stretches (70–82 %)
+        emit(70);
         let samples = apply_stretches(&audio.samples, audio.channels, audio.sample_rate, &stretches);
+
+        // Stage 3: write temp WAV (82–88 %)
+        emit(82);
+        let tmp_wav = format!("{}.tmp_export.wav", output_path);
         write_wav(&samples, audio.channels, audio.sample_rate, &tmp_wav)?;
 
-        let status = std::process::Command::new("ffmpeg")
-            .args(["-y", "-i", &tmp_wav, "-q:a", "2", &output_path])
-            .status()
+        // Stage 4: ffmpeg encode (88–100 %)
+        // Use -progress pipe:1 for structured per-frame progress on stdout.
+        emit(88);
+        let mut child = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-i", &tmp_wav,
+                "-q:a", "2",
+                "-progress", "pipe:1",
+                "-nostats",
+                &output_path,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|e| format!("ffmpeg not found: {e}. Install with: brew install ffmpeg"))?;
 
+        if let Some(stdout) = child.stdout.take() {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stdout).lines().flatten() {
+                // ffmpeg -progress emits "out_time_us=<microseconds>"
+                if let Some(us_str) = line.strip_prefix("out_time_us=") {
+                    if let Ok(us) = us_str.trim().parse::<i64>() {
+                        if duration_secs > 0.0 {
+                            let frac = (us as f64 / 1_000_000.0 / duration_secs).clamp(0.0, 1.0);
+                            emit((88.0 + frac * 11.0) as u8);
+                        }
+                    }
+                }
+            }
+        }
+
+        let status = child.wait().map_err(|e| format!("ffmpeg error: {e}"))?;
         let _ = std::fs::remove_file(&tmp_wav);
 
         if status.success() {
+            emit(100);
             Ok(())
         } else {
             Err(format!("ffmpeg exited with status {status}"))
@@ -122,7 +150,7 @@ pub async fn export_mp3(
 #[tauri::command]
 pub async fn get_audio_duration(path: String) -> Result<f64, String> {
     tokio::task::spawn_blocking(move || {
-        let audio = decode_audio_file(&path)?;
+        let audio = decode_audio_file_with_progress(&path, |_| {})?;
         Ok(audio.duration_secs)
     })
     .await

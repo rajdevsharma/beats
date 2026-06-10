@@ -1,13 +1,110 @@
 import { useEffect, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
 import Timeline from "wavesurfer.js/dist/plugins/timeline.esm.js";
-import RegionsPlugin, { type Region } from "wavesurfer.js/dist/plugins/regions.esm.js";
+import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
-import { originalToStretched } from "./timeMapping";
+
+// ── Salamander Grand Piano sampler ─────────────────────────────────────────
+// Free Steinway D recording by Alexander Holm, hosted by Tone.js.
+// Samples every minor third across the full 88-key range (~2 MB total).
+const SALAMANDER_BASE = 'https://tonejs.github.io/audio/salamander/';
+const SALAMANDER_NOTES: [string, number][] = [
+  ['A0',21],['C1',24],['Ds1',27],['Fs1',30],
+  ['A1',33],['C2',36],['Ds2',39],['Fs2',42],
+  ['A2',45],['C3',48],['Ds3',51],['Fs3',54],
+  ['A3',57],['C4',60],['Ds4',63],['Fs4',66],
+  ['A4',69],['C5',72],['Ds5',75],['Fs5',78],
+  ['A5',81],['C6',84],['Ds6',87],['Fs6',90],
+  ['A6',93],['C7',96],['Ds7',99],['Fs7',102],
+  ['A7',105],['C8',108],
+];
+
+class PianoSampler {
+  private buffers = new Map<number, AudioBuffer>();
+  private fetchPromise: Promise<void> | null = null;
+
+  // Phase 1: download MP3 bytes (no AudioContext needed, safe before user gesture)
+  fetch(onProgress?: (loaded: number, total: number) => void): Promise<void> {
+    if (this.fetchPromise) return this.fetchPromise;
+    const rawBuffers = new Map<number, ArrayBuffer>();
+    let loaded = 0;
+    this.fetchPromise = Promise.all(
+      SALAMANDER_NOTES.map(async ([name, midi]) => {
+        const res = await fetch(`${SALAMANDER_BASE}${name}.mp3`);
+        rawBuffers.set(midi, await res.arrayBuffer());
+        onProgress?.(++loaded, SALAMANDER_NOTES.length);
+      })
+    ).then(async () => {
+      // Phase 2 is kicked off by decode() — store raw so decode() can use them
+      (this as any)._raw = rawBuffers;
+    });
+    return this.fetchPromise;
+  }
+
+  // Phase 2: decode ArrayBuffers using the live AudioContext (call after fetch resolves)
+  async decode(ctx: AudioContext): Promise<void> {
+    const raw: Map<number, ArrayBuffer> = (this as any)._raw;
+    if (!raw) return;
+    await Promise.all(
+      Array.from(raw.entries()).map(async ([midi, ab]) => {
+        const buf = await ctx.decodeAudioData(ab);
+        this.buffers.set(midi, buf);
+      })
+    );
+    (this as any)._raw = null;
+  }
+
+  get isReady() { return this.buffers.size === SALAMANDER_NOTES.length; }
+
+  scheduleNote(
+    ctx: AudioContext, out: AudioNode,
+    pitch: number, vel: number, wallStart: number, dur: number,
+  ): (now: number) => void {
+    // Nearest sample — at most 1.5 semitones away, inaudible pitch error
+    let nearest = 21, minDist = Infinity;
+    for (const [, midi] of SALAMANDER_NOTES) {
+      const d = Math.abs(midi - pitch);
+      if (d < minDist) { minDist = d; nearest = midi; }
+    }
+    const buffer = this.buffers.get(nearest)!;
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = Math.pow(2, (pitch - nearest) / 12);
+
+    const gain = ctx.createGain();
+    const amp = vel * 0.82;
+    // Hold at full level while the key is down, then let the string ring out.
+    // Release time is pitch-dependent: bass strings sustain longer than treble.
+    const releaseTime = Math.max(0.6, Math.min(4.0, 2.5 - (pitch - 69) * 0.02));
+    gain.gain.setValueAtTime(amp, wallStart);
+    gain.gain.setValueAtTime(amp, wallStart + dur);
+    gain.gain.exponentialRampToValueAtTime(
+      Math.max(0.0001, amp * 0.08), wallStart + dur + releaseTime
+    );
+
+    const totalDur = dur + releaseTime + 0.1;
+    source.connect(gain);
+    gain.connect(out);
+    source.start(wallStart);
+    source.stop(wallStart + totalDur);
+
+    return (now: number) => {
+      try {
+        gain.gain.cancelScheduledValues(now);
+        gain.gain.setValueAtTime(gain.gain.value, now);
+        gain.gain.linearRampToValueAtTime(0.0001, now + 0.03);
+        source.stop(now + 0.04);
+      } catch { /* already stopped */ }
+    };
+  }
+}
+
+// Module-level singleton so samples survive component re-mounts
+let globalPianoSampler: PianoSampler | null = null;
 
 interface Props {
   mp3Path: string;
@@ -15,8 +112,8 @@ interface Props {
   onBeatsChange: (beats: number[]) => void;
   stretches: Stretch[];
   onStretchesChange: (stretches: Stretch[]) => void;
-  bakedWavPath?: string;
-  onBakedWavPathChange: (path: string) => void;
+  midiBeats: number[];
+  onMidiBeatsChange: (midiBeats: number[]) => void;
 }
 
 function formatTime(seconds: number): string {
@@ -27,80 +124,266 @@ function formatTime(seconds: number): string {
 }
 
 interface PositionEvent { t: number; playing: boolean; }
-interface LoadResult { peaks: number[][]; duration: number; sample_rate: number; channels: number; }
+interface LoadResult {
+  peaks: number[][];
+  bass_peaks: number[][];
+  duration: number;
+  sample_rate: number;
+  channels: number;
+  spectrogram: string;       // base64 flat u8 [col * bins + bin]
+  spec_cols: number;
+  spec_bins: number;
+  spec_cols_per_sec: number;
+}
 
-const ZOOM_STEP = 1.5;
+// Inferno colormap (sampled from matplotlib) — perceptually designed for spectrograms.
+// Goes black → dark purple → red → orange → bright yellow, giving high contrast
+// across the full dynamic range.
+const INFERNO = (() => {
+  const pts: [number, number, number][] = [
+    [0,0,4],[14,6,36],[30,10,68],[50,11,93],[72,12,108],[94,13,117],
+    [116,14,118],[135,18,113],[155,25,100],[174,35,84],[190,50,65],
+    [203,67,48],[213,85,32],[221,104,17],[229,122,6],[237,143,8],
+    [243,165,27],[247,188,55],[250,210,89],[252,232,130],[252,255,164],
+  ];
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t  = i / 255 * (pts.length - 1);
+    const lo = Math.floor(t);
+    const hi = Math.min(lo + 1, pts.length - 1);
+    const f  = t - lo;
+    lut[i*3]   = Math.round(pts[lo][0] + (pts[hi][0] - pts[lo][0]) * f);
+    lut[i*3+1] = Math.round(pts[lo][1] + (pts[hi][1] - pts[lo][1]) * f);
+    lut[i*3+2] = Math.round(pts[lo][2] + (pts[hi][2] - pts[lo][2]) * f);
+  }
+  return lut;
+})();
+
+// ── Piano Roll ─────────────────────────────────────────────────────────────
+type MidiNote = { time: number; dur: number; pitch: number; vel: number };
+interface MidiTrack { name: string; notes: MidiNote[]; isPiano: boolean; }
+interface TrackStats {
+  density:       number; // 0–1, notes/sec relative to busiest track
+  ioiRegularity: number; // 0–1, 1 = perfectly regular (low IOI variance)
+}
+type RollOptions = {
+  durationAlpha:   boolean;
+  attackFlash:     boolean;
+  compressSustain: boolean;
+  densityWeight:   boolean;
+  velocityAlpha:   boolean;
+  ioiRegularity:   boolean;
+  gridLock:        boolean;
+};
+const DEFAULT_ROLL_OPTIONS: RollOptions = {
+  durationAlpha: false, attackFlash: false, compressSustain: false,
+  densityWeight: false, velocityAlpha: false, ioiRegularity: false, gridLock: false,
+};
+const ROLL_OPTION_LABELS: { key: keyof RollOptions; label: string; title: string }[] = [
+  { key: 'durationAlpha',   label: 'Dur α',    title: 'Short notes bright, sustained notes faint' },
+  { key: 'attackFlash',     label: 'Flash',    title: 'Bright 2px strike at every note onset' },
+  { key: 'compressSustain', label: 'Squeeze',  title: 'Compress sustained notes to half height' },
+  { key: 'densityWeight',   label: 'Density',  title: 'Busier tracks rendered brighter' },
+  { key: 'velocityAlpha',   label: 'Vel α',    title: 'Loud notes opaque, soft notes transparent' },
+  { key: 'ioiRegularity',   label: 'IOI',      title: 'Show beat-regularity bar in legend' },
+  { key: 'gridLock',        label: 'Grid',     title: 'Highlight tracks that play on beats' },
+];
+const PIANO_ROLL_H = 220;   // px
+const KEYBOARD_W   = 40;    // px, left keyboard strip
+// Perceptually-distinct hues, ordered so the first 8 are maximally far apart
+// (no two within ~40°) and no green cluster. Assigned by prominence rank so
+// the most-featured instruments always get the most visually separated colors.
+const PALETTE_HUES = [
+   0,   // red
+ 210,   // sky-blue
+  45,   // amber
+ 280,   // purple
+ 160,   // emerald
+ 330,   // rose
+ 195,   // teal
+  85,   // lime
+  25,   // orange
+ 255,   // indigo
+ 310,   // violet-pink
+ 130,   // green
+  60,   // yellow
+ 230,   // cornflower
+ 350,   // crimson
+ 170,   // seafoam
+ 300,   // magenta
+ 100,   // chartreuse
+ 220,   // blue
+  10,   // red-orange
+];
+
+function computeTrackColors(tracks: MidiTrack[]): string[] {
+  const nonPiano = tracks
+    .map((t, i) => ({ i, count: t.notes.length }))
+    .filter((_, idx) => !tracks[idx].isPiano)
+    .sort((a, b) => b.count - a.count);
+
+  // rankOf[trackIndex] = 0 for most notes, increasing for fewer notes
+  const rankOf = new Map(nonPiano.map((x, rank) => [x.i, rank]));
+  const total = nonPiano.length || 1;
+
+  return tracks.map((t, i) => {
+    if (t.isPiano) return '#ffffff';
+    const rank = rankOf.get(i) ?? total - 1;
+    const prominence = 1 - rank / total; // 1 = most notes, 0 = fewest
+    const hue = PALETTE_HUES[rank % PALETTE_HUES.length];
+    const sat = Math.round(55 + prominence * 40);  // 55 – 95 %
+    const lit = Math.round(42 + prominence * 28);  // 42 – 70 %
+    return `hsl(${hue},${sat}%,${lit}%)`;
+  });
+}
+const BLACK_PCS = new Set([1, 3, 6, 8, 10]);
+
+const ZOOM_STEP = 1.5 ** 0.2; // ~1.084 — 5× less sensitive than original 1.5
 const ZOOM_MAX_MULTIPLIER = 500;
 const ZOOM_DEBOUNCE_MS = 80;
 const PLAYBACK_RATES = [0.25, 0.5, 0.75, 1.0];
-const BEAT_WIDTH_S = 0.002;
-const BEAT_COLOR = "rgba(251, 191, 36, 0.80)";
-const BEAT_COLOR_SELECTED = "rgba(255, 100, 60, 0.90)";
-const ANCHOR_REGION_ID = "stretch-anchor";
 
 export default function WaveformEditor({
-  mp3Path, beats, onBeatsChange, stretches, onStretchesChange,
-  bakedWavPath, onBakedWavPathChange,
+  mp3Path, beats, onBeatsChange, stretches, onStretchesChange, midiBeats, onMidiBeatsChange,
 }: Props) {
   // ── DOM / WaveSurfer refs ──────────────────────────────────────────────────
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
   const regionsRef = useRef<RegionsPlugin | null>(null);
+  const bassContainerRef = useRef<HTMLDivElement>(null);
+  const bassWsRef = useRef<WaveSurfer | null>(null);
+  const beatsStripOuterRef = useRef<HTMLDivElement>(null);
+  const beatsStripInnerRef = useRef<HTMLDivElement>(null);
 
   // ── Zoom refs ──────────────────────────────────────────────────────────────
   const fitPxPerSecRef = useRef<number>(0);
   const zoomPxPerSecRef = useRef<number>(0);
   const zoomTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const zoomRafRef = useRef<number | null>(null);
+  const beatLabelElsRef = useRef<Map<number, HTMLElement>>(new Map());
 
   // ── Stable refs for event handlers ────────────────────────────────────────
   const beatsRef = useRef<number[]>(beats);
   const stretchesRef = useRef<Stretch[]>(stretches);
   const onBeatsChangeRef = useRef(onBeatsChange);
   const onStretchesChangeRef = useRef(onStretchesChange);
+  const onMidiBeatsChangeRef = useRef(onMidiBeatsChange);
   const recordingRef = useRef(false);
   const recordingStartTimeRef = useRef(0);
   const pendingTapsRef = useRef<number[]>([]);
   const selectedBeatTimeRef = useRef<number | null>(null);
   const shiftHeldRef = useRef(false);
-  const stretchModeRef = useRef(false);
-  const stretchAnchorRef = useRef<number | null>(null);
+  const cmdHeldRef = useRef(false);
+  const selectionRef = useRef<{ start: number; end: number } | null>(null);
   const regionJustClickedRef = useRef(false);
   const durationRef = useRef(0);
   const currentTimeRef = useRef(0);
   const playingRef = useRef(false);
+  const selectedTimelineRef = useRef<'mp3' | 'midi'>('mp3');
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
   const [ready, setReady] = useState(false);
   const [playing, setPlaying] = useState(false);
+  const [selectedTimeline, setSelectedTimeline] = useState<'mp3' | 'midi'>('mp3');
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [zoomPxPerSec, setZoomPxPerSec] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1.0);
   const [recording, setRecording] = useState(false);
   const [selectedBeatTime, setSelectedBeatTime] = useState<number | null>(null);
-  const [stretchMode, setStretchMode] = useState(false);
-  const [stretchAnchor, setStretchAnchor] = useState<number | null>(null);
-  const [stretchModal, setStretchModal] = useState<{ start: number; end: number } | null>(null);
-  const [rerendering, setRerendering] = useState(false);
-  const [exporting, setExporting] = useState(false);
+  const [selection, setSelection] = useState<{ start: number; end: number } | null>(null);
+  const [stretchModal, setStretchModal] = useState<{ start: number; end: number; existingFactor?: number } | null>(null);
+  const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rateProcessing, setRateProcessing] = useState(false);
   // PCM decode happens in background after waveform is shown
   const [pcmReady, setPcmReady] = useState(false);
+  const [loadPhase, setLoadPhase] = useState("");
+  const [playBeats, setPlayBeats] = useState(() =>
+    localStorage.getItem("beats_play_beats") !== "false"
+  );
+  const playBeatsRef = useRef(playBeats);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const lastAudioPosRef = useRef<number>(-1);
+
+  // ── Spectrogram ────────────────────────────────────────────────────────────
+  const specCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const specDataRef = useRef<Uint8Array | null>(null);
+  const specColsRef = useRef(0);
+  const specBinsRef = useRef(0);
+  const specColsPerSecRef = useRef(0);
+  const scrollLeftRef = useRef(0);
+  const [showSpec, setShowSpec] = useState(() =>
+    localStorage.getItem("beats_show_spec") !== "false"
+  );
+  const showSpecRef = useRef(showSpec);
+  useEffect(() => { showSpecRef.current = showSpec; }, [showSpec]);
+
+  // ── Piano Roll state ───────────────────────────────────────────────────────
+  const [midiLegend, setMidiLegend] = useState<{ name: string; color: string }[]>([]);
+  const [soloTrackIndex, setSoloTrackIndex] = useState<number | null>(null);
+  const soloTrackIndexRef = useRef<number | null>(null);
+  const [rollOptions, setRollOptions] = useState<RollOptions>(DEFAULT_ROLL_OPTIONS);
+  const pianoRollCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pianoKeyCanvasRef  = useRef<HTMLCanvasElement | null>(null);
+  const midiTracksRef      = useRef<MidiTrack[]>([]);
+  const midiTrackColorsRef = useRef<string[]>([]);
+  const midiTrackStatsRef  = useRef<TrackStats[]>([]);
+  const gridLockCacheRef   = useRef<{ key: string; scores: number[] } | null>(null);
+  const rollOptionsRef     = useRef<RollOptions>(DEFAULT_ROLL_OPTIONS);
+  const midiRangeRef       = useRef({ min: 21, max: 108 });
+
+  // ── MIDI playback engine ───────────────────────────────────────────────────
+  const midiAudioCtxRef    = useRef<AudioContext & { masterOut?: AudioNode } | null>(null);
+  const midiPlayingRef     = useRef(false);
+  const midiStartWallRef   = useRef(0);   // audioCtx.currentTime when play was pressed
+  const midiStartPosRef    = useRef(0);   // MIDI cursor position (MIDI time) at play start
+  const midiStartAudioRef  = useRef(0);   // audio timeline position at play start
+  const midiScheduledToRef = useRef(0);   // audio time we've scheduled notes up to
+  const midiActiveNodesRef = useRef<Array<{ stop: (now: number) => void }>>([]);
+  const midiSchedulerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const midiCursorRafRef   = useRef<number | null>(null);
+  const midiCursorRef      = useRef(0);   // current MIDI cursor (MIDI seconds)
+  const midiDurationRef    = useRef(0);   // total MIDI duration
+
+  const [midiPlaying, setMidiPlaying]   = useState(false);
+  const [midiCursorDisp, setMidiCursorDisp] = useState(0); // for header display only
+  const [samplerStatus, setSamplerStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>(() =>
+    globalPianoSampler?.isReady ? 'ready' : 'idle'
+  );
+  const [samplerProgress, setSamplerProgress] = useState(0);
+  const midiBeatsRef = useRef<number[]>(midiBeats);
+  const [selectedMidiBeat, setSelectedMidiBeat] = useState<number | null>(null);
+  const selectedMidiBeatRef = useRef<number | null>(null);
+  useEffect(() => { selectedMidiBeatRef.current = selectedMidiBeat; }, [selectedMidiBeat]);
+
+  useEffect(() => { playBeatsRef.current = playBeats; }, [playBeats]);
 
   // Keep refs in sync
-  useEffect(() => { beatsRef.current = beats; }, [beats]);
+  useEffect(() => { beatsRef.current = beats; drawPianoRoll(); }, [beats]);
   useEffect(() => { stretchesRef.current = stretches; }, [stretches]);
   useEffect(() => { onBeatsChangeRef.current = onBeatsChange; }, [onBeatsChange]);
   useEffect(() => { onStretchesChangeRef.current = onStretchesChange; }, [onStretchesChange]);
+  useEffect(() => { onMidiBeatsChangeRef.current = onMidiBeatsChange; }, [onMidiBeatsChange]);
+  useEffect(() => { midiBeatsRef.current = midiBeats; drawPianoRoll(); }, [midiBeats]);
+  useEffect(() => { soloTrackIndexRef.current = soloTrackIndex; drawPianoRoll(); }, [soloTrackIndex]);
+  useEffect(() => { rollOptionsRef.current = rollOptions; drawPianoRoll(); }, [rollOptions]);
   useEffect(() => { selectedBeatTimeRef.current = selectedBeatTime; }, [selectedBeatTime]);
-  useEffect(() => { stretchModeRef.current = stretchMode; }, [stretchMode]);
-  useEffect(() => { stretchAnchorRef.current = stretchAnchor; }, [stretchAnchor]);
+  useEffect(() => { selectionRef.current = selection; }, [selection]);
   useEffect(() => { durationRef.current = duration; }, [duration]);
   useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
   useEffect(() => { playingRef.current = playing; }, [playing]);
+
+  // Update cursor colors when the selected timeline changes
+  useEffect(() => {
+    const mp3Color = selectedTimeline === 'mp3' ? '#44ff88' : '#ffdd44';
+    wsRef.current?.setOptions({ cursorColor: mp3Color });
+    bassWsRef.current?.setOptions({ cursorColor: mp3Color });
+    drawPianoRoll();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTimeline]);
 
   // ── WaveSurfer creation (display only — Rust drives audio) ────────────────
   useEffect(() => {
@@ -113,9 +396,9 @@ export default function WaveformEditor({
       container: containerRef.current,
       waveColor: "#5a4fcf",
       progressColor: "#9b8eff",
-      cursorColor: "#ffffff",
+      cursorColor: "#ffdd44",
       cursorWidth: 2,
-      height: 128,
+      height: containerRef.current.clientHeight || 128,
       normalize: true,
       autoScroll: true,
       autoCenter: true,
@@ -130,60 +413,1165 @@ export default function WaveformEditor({
       setReady(true);
       const fit = containerRef.current!.clientWidth / dur;
       fitPxPerSecRef.current = fit;
-      zoomPxPerSecRef.current = fit;
-      setZoomPxPerSec(fit);
+
+      const savedRaw = localStorage.getItem(`beats_view_${mp3Path}`);
+      const saved = savedRaw ? JSON.parse(savedRaw) as { multiplier: number; scrollTime: number } : null;
+      const multiplier = saved?.multiplier ?? 1;
+      const scrollTime = saved?.scrollTime ?? 0;
+      const zoom = fit * Math.max(1, multiplier);
+      zoomPxPerSecRef.current = zoom;
+      setZoomPxPerSec(zoom);
+
+      if (multiplier > 1) {
+        ws.zoom(zoom);
+        // Bass WaveSurfer may not have loaded yet here — zoom it after its own ready event
+      }
+
+      // Restore scroll after the DOM has applied the zoom
+      requestAnimationFrame(() => {
+        const scrollLeft = scrollTime * zoom;
+        const scrollEl = ws.getWrapper().parentElement as HTMLElement | null;
+        if (scrollEl) scrollEl.scrollLeft = scrollLeft;
+        bassWsRef.current?.setScroll(scrollLeft);
+        scrollLeftRef.current = scrollLeft;
+        if (beatsStripInnerRef.current)
+          beatsStripInnerRef.current.style.transform = `translateX(-${scrollLeft}px)`;
+        drawSpectrogram();
+        drawPianoRoll();
+      });
+
       setLoadProgress(100);
+      drawSpectrogram();
+      drawPianoRoll();
     });
 
-    ws.on("interaction", () => {
-      if (regionJustClickedRef.current) return;
-      const t = ws.getCurrentTime();
+    ws.on("scroll", (_s: number, _e: number, scrollLeft: number) => {
+      scrollLeftRef.current = scrollLeft;
+      drawSpectrogram();
+      drawPianoRoll();
+      if (beatsStripInnerRef.current) {
+        beatsStripInnerRef.current.style.transform = `translateX(-${scrollLeft}px)`;
+      }
+      // Persist view state (debounced via the zoom timer slot)
+      const fit = fitPxPerSecRef.current;
+      if (fit) {
+        const multiplier = zoomPxPerSecRef.current / fit;
+        const scrollT = scrollLeft / zoomPxPerSecRef.current;
+        localStorage.setItem(`beats_view_${mp3Path}`, JSON.stringify({ multiplier, scrollTime: scrollT }));
+      }
+    });
 
-      if (stretchModeRef.current) {
-        if (shiftHeldRef.current && stretchAnchorRef.current !== null) {
-          const a = stretchAnchorRef.current;
-          const start = Math.min(a, t);
-          const end = Math.max(a, t);
-          if (end - start > 0.01) setStretchModal({ start, end });
-        } else if (!shiftHeldRef.current) {
-          stretchAnchorRef.current = t;
-          setStretchAnchor(t);
+    ws.on("interaction", (t: number) => {
+      if (regionJustClickedRef.current) return;
+
+      // Any interaction with the top timeline selects it
+      selectedTimelineRef.current = 'mp3';
+      setSelectedTimeline('mp3');
+
+      if (cmdHeldRef.current) {
+        // Cmd+click: add a beat
+        const updated = [...beatsRef.current, t].sort((a, b) => a - b);
+        onBeatsChangeRef.current(updated);
+        return;
+      }
+
+      if (shiftHeldRef.current) {
+        // Shift+click: set selection from current cursor to clicked point
+        const anchor = currentTimeRef.current;
+        const start = Math.min(anchor, t);
+        const end = Math.max(anchor, t);
+        if (end - start > 0.01) {
+          selectionRef.current = { start, end };
+          setSelection({ start, end });
         }
         return;
       }
 
+      // Plain click: seek and clear any selection
       handleSeek(t);
+      selectionRef.current = null;
+      setSelection(null);
 
-      if (shiftHeldRef.current) {
-        const updated = [...beatsRef.current, t].sort((a, b) => a - b);
-        onBeatsChangeRef.current(updated);
+      // Sync MIDI cursor if t is within the jointly-annotated range
+      {
+        const mb = midiBeatsRef.current;
+        const ab = beatsRef.current;
+        const n = Math.min(mb.length, ab.length);
+        if (n >= 2 && t >= ab[0] && t <= ab[n - 1]) {
+          midiSeekTo(audioTimeToMidiTime(t));
+        }
       }
     });
 
     // Ctrl+wheel zoom
-    function onWheel(e: WheelEvent) {
-      if (!e.ctrlKey) return;
-      e.preventDefault();
-      const fit = fitPxPerSecRef.current;
-      if (fit === 0) return;
-      const factor = e.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
-      const next = Math.max(fit, Math.min(zoomPxPerSecRef.current * factor, fit * ZOOM_MAX_MULTIPLIER));
-      zoomPxPerSecRef.current = next;
-      setZoomPxPerSec(next);
-      if (zoomTimerRef.current) clearTimeout(zoomTimerRef.current);
-      zoomTimerRef.current = setTimeout(() => ws.zoom(zoomPxPerSecRef.current), ZOOM_DEBOUNCE_MS);
-    }
-    containerRef.current.addEventListener("wheel", onWheel, { passive: false });
-
     wsRef.current = ws;
 
     return () => {
       ws.destroy();
       wsRef.current = null;
       regionsRef.current = null;
-      containerRef.current?.removeEventListener("wheel", onWheel);
     };
   }, [mp3Path]);
+
+  // ── Bass WaveSurfer (separate small instance) ─────────────────────────────
+  useEffect(() => {
+    if (!bassContainerRef.current) return;
+
+    const bws = WaveSurfer.create({
+      container: bassContainerRef.current,
+      waveColor: "rgba(251, 146, 60, 0.75)",
+      progressColor: "rgba(251, 146, 60, 0.4)",
+      cursorColor: "#ffdd44",
+      cursorWidth: 2,
+      height: bassContainerRef.current.clientHeight || 52,
+      normalize: true,
+      autoScroll: false,
+      autoCenter: false,
+      interact: false,
+      hideScrollbar: true,
+    });
+
+    // Sync scroll from main waveform
+    const unsub = wsRef.current?.on("scroll", (_s, _e, scrollLeft: number) => {
+      bws.setScroll(scrollLeft);
+    });
+
+    // Apply saved zoom once bass waveform has its own data loaded
+    bws.on("ready", () => {
+      const z = zoomPxPerSecRef.current;
+      if (z > 0) bws.zoom(z);
+    });
+
+    bassWsRef.current = bws;
+    return () => {
+      unsub?.();
+      bws.destroy();
+      bassWsRef.current = null;
+    };
+  }, [mp3Path]);
+
+  // ── Resize observer: keep WaveSurfer height in sync with container ────────
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(entries => {
+      const h = entries[0]?.contentRect.height;
+      if (h && h > 0) wsRef.current?.setOptions({ height: h });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // ── Spectrogram canvas (injected as overlay inside WaveSurfer container) ───
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    // Ensure container is positioned so absolute children are relative to it
+    el.style.position = 'relative';
+
+    const canvas = document.createElement('canvas');
+    canvas.style.cssText =
+      'position:absolute;top:0;left:0;width:100%;pointer-events:none;z-index:5;opacity:0.8;';
+    el.appendChild(canvas);
+    specCanvasRef.current = canvas;
+
+    const elNN = el; // capture non-null for closure
+    function resize() {
+      canvas.width = elNN.clientWidth;
+      canvas.height = elNN.clientHeight;
+      drawSpectrogram();
+    }
+
+    const ro = new ResizeObserver(resize);
+    ro.observe(el);
+    resize();
+
+    return () => {
+      ro.disconnect();
+      canvas.remove();
+      specCanvasRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mp3Path]);
+
+  // ── Piano Roll canvas setup ────────────────────────────────────────────────
+  useEffect(() => {
+    const container = document.querySelector('.piano-roll-notes') as HTMLDivElement | null;
+    const keyContainer = document.querySelector('.piano-key-wrap') as HTMLDivElement | null;
+    if (!container || !keyContainer) return;
+
+    const noteCanvas = document.createElement('canvas');
+    noteCanvas.style.cssText = 'display:block;width:100%;height:100%;';
+    container.appendChild(noteCanvas);
+    pianoRollCanvasRef.current = noteCanvas;
+
+    const keyCanvas = document.createElement('canvas');
+    keyCanvas.style.cssText = 'display:block;width:100%;height:100%;';
+    keyContainer.appendChild(keyCanvas);
+    pianoKeyCanvasRef.current = keyCanvas;
+
+    function resize() {
+      noteCanvas.width  = container!.clientWidth;
+      noteCanvas.height = container!.clientHeight;
+      keyCanvas.width   = keyContainer!.clientWidth;
+      keyCanvas.height  = keyContainer!.clientHeight;
+      drawPianoRoll();
+      drawPianoKeyboard();
+    }
+
+    function onPointerDown(e: PointerEvent) {
+      if (e.button !== 0) return;
+
+      // Any click in the piano roll selects the bottom timeline
+      selectedTimelineRef.current = 'midi';
+      setSelectedTimeline('midi');
+
+      const rect = noteCanvas.getBoundingClientRect();
+      const x    = e.clientX - rect.left;
+
+      // Cmd/Ctrl+click → add a new MIDI beat
+      if (e.metaKey || e.ctrlKey) {
+        e.preventDefault();
+        const midiT = canvasXToMidiTime(x);
+        const next = [...midiBeatsRef.current, midiT].sort((a, b) => a - b);
+        midiBeatsRef.current = next;
+        onMidiBeatsChangeRef.current(next);
+        selectedMidiBeatRef.current = midiT;
+        setSelectedMidiBeat(midiT);
+        drawPianoRoll();
+        return;
+      }
+
+      // Hit-test existing beat markers
+      const hit: number | null = hitTestMidiBeat(x);
+      if (hit !== null) {
+        const hitBeat: number = hit;
+        e.preventDefault();
+        noteCanvas.setPointerCapture(e.pointerId);
+
+        const startClientX  = e.clientX;
+        const pxPerSec      = zoomPxPerSecRef.current;
+        const hasWarp       = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
+        const startAudioT   = (hasWarp ? warpMidiTime(hit) : hit);
+        const startX        = startAudioT * pxPerSec - scrollLeftRef.current - KEYBOARD_W;
+        let dragging        = false;
+        let liveMidiT       = hit;
+
+        function onMove(ev: PointerEvent) {
+          const dx = ev.clientX - startClientX;
+          if (!dragging && Math.abs(dx) > 3) {
+            dragging = true;
+            noteCanvas.style.cursor = 'grabbing';
+          }
+          if (!dragging) return;
+          liveMidiT = canvasXToMidiTime(startX + dx);
+          // Update ref for live drawing without touching state
+          midiBeatsRef.current = midiBeatsRef.current
+            .map(bt => Math.abs(bt - hitBeat) < 0.001 ? liveMidiT : bt)
+            .sort((a, b) => a - b);
+          selectedMidiBeatRef.current = liveMidiT;
+          drawPianoRoll();
+        }
+
+        function onUp() {
+          noteCanvas.releasePointerCapture(e.pointerId);
+          noteCanvas.removeEventListener('pointermove', onMove);
+          noteCanvas.removeEventListener('pointerup',   onUp);
+          noteCanvas.style.cursor = '';
+          if (dragging) {
+            onMidiBeatsChangeRef.current([...midiBeatsRef.current]);
+            setSelectedMidiBeat(liveMidiT);
+            selectedBeatTimeRef.current = null;
+            setSelectedBeatTime(null);
+          } else {
+            // plain click: select / deselect
+            const alreadySel = selectedMidiBeatRef.current !== null &&
+              Math.abs(selectedMidiBeatRef.current - hitBeat) < 0.001;
+            selectedMidiBeatRef.current = alreadySel ? null : hitBeat;
+            setSelectedMidiBeat(alreadySel ? null : hitBeat);
+            if (!alreadySel) {
+              selectedBeatTimeRef.current = null;
+              setSelectedBeatTime(null);
+            }
+            drawPianoRoll();
+          }
+        }
+
+        noteCanvas.addEventListener('pointermove', onMove);
+        noteCanvas.addEventListener('pointerup',   onUp);
+        return;
+      }
+
+      // Empty area: pan on drag, seek on plain click (decided on pointerup)
+      {
+        const startClientX = e.clientX;
+        const getScrollEl = () => {
+          const ws = wsRef.current;
+          return ws ? (ws.getWrapper().parentElement as HTMLElement | null) : null;
+        };
+        const startScrollLeft = getScrollEl()?.scrollLeft ?? 0;
+        let panning = false;
+
+        function onPanMove(ev: PointerEvent) {
+          const dx = ev.clientX - startClientX;
+          if (!panning && Math.abs(dx) > 4) {
+            panning = true;
+            noteCanvas.style.cursor = 'grabbing';
+          }
+          if (panning) {
+            const scrollEl = getScrollEl();
+            if (scrollEl) scrollEl.scrollLeft = startScrollLeft - dx;
+          }
+        }
+
+        function onPanUp(ev: PointerEvent) {
+          noteCanvas.removeEventListener('pointermove', onPanMove);
+          noteCanvas.removeEventListener('pointerup', onPanUp);
+          noteCanvas.style.cursor = '';
+          if (panning) return;
+          // Plain click — seek and optionally sync MP3 cursor
+          const rect = noteCanvas.getBoundingClientRect();
+          const midiT = canvasXToMidiTime(ev.clientX - rect.left);
+          midiSeekTo(midiT);
+          const mb = midiBeatsRef.current;
+          const ab = beatsRef.current;
+          const n = Math.min(mb.length, ab.length);
+          if (n >= 2 && midiT >= mb[0] && midiT <= mb[n - 1]) {
+            handleSeek(warpMidiTime(midiT));
+          }
+        }
+
+        noteCanvas.addEventListener('pointermove', onPanMove);
+        noteCanvas.addEventListener('pointerup', onPanUp);
+      }
+    }
+
+    function onPointerMove(e: PointerEvent) {
+      if (e.buttons !== 0) return; // ignore while dragging
+      const rect = noteCanvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      noteCanvas.style.cursor = hitTestMidiBeat(x) !== null ? 'grab' : '';
+    }
+
+    noteCanvas.addEventListener('pointerdown', onPointerDown);
+    noteCanvas.addEventListener('pointermove', onPointerMove);
+    const ro = new ResizeObserver(resize);
+    ro.observe(container);
+    resize();
+    return () => {
+      ro.disconnect();
+      noteCanvas.removeEventListener('pointerdown', onPointerDown);
+      noteCanvas.removeEventListener('pointermove', onPointerMove);
+      noteCanvas.remove();
+      keyCanvas.remove();
+      pianoRollCanvasRef.current = null;
+      pianoKeyCanvasRef.current  = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Load MIDI on movement change ───────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { Midi } = await import('@tonejs/midi');
+        const midi = await Midi.fromUrl('/midi/rach2_all.mid');
+        if (cancelled) return;
+        let minP = 127, maxP = 0;
+        const tracks: MidiTrack[] = midi.tracks
+          .filter(t => t.notes.length > 0)
+          .map(t => {
+            const notes = t.notes.map(n => {
+              if (n.midi < minP) minP = n.midi;
+              if (n.midi > maxP) maxP = n.midi;
+              return { time: n.time, dur: n.duration, pitch: n.midi, vel: n.velocity };
+            });
+            return {
+              name: t.name || t.instrument.name || 'Track',
+              notes,
+              isPiano: /piano(forte)?/i.test(t.name || ''),
+            };
+          });
+        midiTracksRef.current  = tracks;
+        midiRangeRef.current   = { min: Math.max(0, minP - 2), max: Math.min(127, maxP + 2) };
+        midiDurationRef.current = midi.duration;
+
+        const colors = computeTrackColors(tracks);
+        midiTrackColorsRef.current = colors;
+
+        // Per-track stats for rendering features
+        const dur = midi.duration || 1;
+        const rawStats = tracks.map(t => {
+          const density = t.notes.length / dur;
+          let ioiRegularity = 0;
+          if (t.notes.length >= 3) {
+            const iois = t.notes.slice(1).map((n, i) => n.time - t.notes[i].time);
+            const mean = iois.reduce((a, b) => a + b, 0) / iois.length;
+            const cv = mean > 0
+              ? Math.sqrt(iois.reduce((s, x) => s + (x - mean) ** 2, 0) / iois.length) / mean
+              : 1;
+            ioiRegularity = Math.max(0, 1 - Math.min(1, cv));
+          }
+          return { density, ioiRegularity };
+        });
+        const maxDensity = Math.max(...rawStats.map(s => s.density), 1);
+        midiTrackStatsRef.current = rawStats.map(s => ({
+          ...s, density: s.density / maxDensity,
+        }));
+        gridLockCacheRef.current = null; // invalidate on reload
+        midiPause();
+        midiCursorRef.current = 0;
+        setMidiCursorDisp(0);
+        setSoloTrackIndex(null);
+        setMidiLegend(tracks.map((t, i) => ({ name: t.name, color: colors[i] })));
+        drawPianoRoll();
+        drawPianoKeyboard();
+
+        // Eagerly prefetch Steinway samples as soon as MIDI loads — no AudioContext
+        // needed for the download phase, so this is safe before any user gesture.
+        if (tracks.some(t => t.isPiano) && !globalPianoSampler?.isReady) {
+          if (!globalPianoSampler) globalPianoSampler = new PianoSampler();
+          setSamplerStatus('loading');
+          setSamplerProgress(0);
+          globalPianoSampler.fetch((n, total) =>
+            setSamplerProgress(Math.round(n / total * 100))
+          ).catch(() => setSamplerStatus('error'));
+          // Decode happens in midiPlay() once the AudioContext exists.
+        }
+      } catch (e) {
+        if (!cancelled) console.error('MIDI load failed:', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Spectrogram draw (reads only refs — stable across renders) ─────────────
+  function drawSpectrogram() {
+    const canvas = specCanvasRef.current;
+    if (!canvas || !showSpecRef.current) {
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      return;
+    }
+    const specData = specDataRef.current;
+    if (!specData) return;
+
+    const width = canvas.width;
+    const height = canvas.height;
+    if (width === 0 || height === 0) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const scrollLeft = scrollLeftRef.current;
+    const pxPerSec = zoomPxPerSecRef.current;
+    const cols = specColsRef.current;
+    const bins = specBinsRef.current;
+    const colsPerSec = specColsPerSecRef.current;
+    if (cols === 0 || bins === 0 || pxPerSec === 0) return;
+
+    const imageData = ctx.createImageData(width, height);
+    const data = imageData.data;
+
+    for (let x = 0; x < width; x++) {
+      const t = (scrollLeft + x) / pxPerSec;
+      const col = Math.floor(t * colsPerSec);
+      if (col < 0 || col >= cols) continue;
+      const colBase = col * bins;
+
+      for (let y = 0; y < height; y++) {
+        // y=0 = top = high freq; y=height-1 = bottom = low freq
+        const b = Math.floor((height - 1 - y) * bins / height);
+        const v = specData[colBase + b];
+        const pi3 = v * 3;
+        const idx = (y * width + x) * 4;
+        data[idx]     = INFERNO[pi3];
+        data[idx + 1] = INFERNO[pi3 + 1];
+        data[idx + 2] = INFERNO[pi3 + 2];
+        data[idx + 3] = Math.round(40 + v * 215); // transparent when silent, opaque when loud
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  // ── Piano Roll helpers ─────────────────────────────────────────────────────
+  // Convert a canvas x-pixel to MIDI time (inverse-warp if beats are aligned)
+  function canvasXToMidiTime(x: number): number {
+    const audioT = (scrollLeftRef.current + KEYBOARD_W + x) / zoomPxPerSecRef.current;
+    const mb = midiBeatsRef.current;
+    const ab = beatsRef.current;
+    const n = Math.min(mb.length, ab.length);
+    if (n === 0) return audioT;
+    if (audioT <= ab[0]) {
+      const ratio = n >= 2 ? (mb[1] - mb[0]) / (ab[1] - ab[0]) : 1;
+      return Math.max(0, mb[0] + (audioT - ab[0]) * ratio);
+    }
+    if (audioT >= ab[n - 1]) {
+      const ratio = n >= 2 ? (mb[n - 1] - mb[n - 2]) / (ab[n - 1] - ab[n - 2]) : 1;
+      return mb[n - 1] + (audioT - ab[n - 1]) * ratio;
+    }
+    for (let i = 0; i < n - 1; i++) {
+      if (audioT >= ab[i] && audioT < ab[i + 1]) {
+        const t = (audioT - ab[i]) / (ab[i + 1] - ab[i]);
+        return mb[i] + t * (mb[i + 1] - mb[i]);
+      }
+    }
+    return audioT;
+  }
+
+  // Find MIDI beat within HIT_RADIUS pixels of canvas x (in display space)
+  function hitTestMidiBeat(x: number): number | null {
+    const HIT = 6;
+    const pxPerSec  = zoomPxPerSecRef.current;
+    const scrollLeft = scrollLeftRef.current + KEYBOARD_W;
+    const mb = midiBeatsRef.current;
+    const ab = beatsRef.current;
+    const hasWarp = mb.length > 0 && ab.length > 0;
+    for (const bt of mb) {
+      const t  = hasWarp ? warpMidiTime(bt) : bt;
+      const bx = t * pxPerSec - scrollLeft;
+      if (Math.abs(x - bx) <= HIT) return bt;
+    }
+    return null;
+  }
+
+  // ── Piano Roll draw ────────────────────────────────────────────────────────
+  function drawPianoRoll() {
+    const canvas = pianoRollCanvasRef.current;
+    if (!canvas) return;
+    const tracks = midiTracksRef.current;
+    const { width, height } = canvas;
+    if (!width || !height) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#080810';
+    ctx.fillRect(0, 0, width, height);
+
+    if (!tracks.length) return;
+
+    const scrollLeft = scrollLeftRef.current + KEYBOARD_W;
+    const pxPerSec   = zoomPxPerSecRef.current;
+    if (!pxPerSec) return;
+
+    const { min: minP, max: maxP } = midiRangeRef.current;
+    const noteRange = maxP - minP + 1;
+    const noteH = height / noteRange;
+
+    // Black key bands and octave lines
+    for (let p = minP; p <= maxP; p++) {
+      const y = (maxP - p) * noteH;
+      if (BLACK_PCS.has(p % 12)) {
+        ctx.fillStyle = '#0c0c18';
+        ctx.fillRect(0, y, width, noteH);
+      }
+      if (p % 12 === 0) {
+        ctx.strokeStyle = '#1e1e30';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(width, y + 0.5); ctx.stroke();
+      }
+    }
+
+    // ── Note rendering ─────────────────────────────────────────────────────────
+    const opts = rollOptionsRef.current;
+    const hasWarp = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
+    const tStart = scrollLeft / pxPerSec;
+    const tEnd   = (scrollLeft + width) / pxPerSec;
+
+    // Avg beat duration in audio seconds (used by duration-alpha and compress)
+    const mb = midiBeatsRef.current;
+    const avgBeatDur = mb.length >= 2
+      ? (mb[mb.length - 1] - mb[0]) / (mb.length - 1) : 0.5;
+
+    // Grid-lock scores: fraction of each track's notes that land on a beat (cached)
+    let gridLockScores: number[] = [];
+    if (opts.gridLock && mb.length >= 2) {
+      const cacheKey = mb.join(',');
+      if (!gridLockCacheRef.current || gridLockCacheRef.current.key !== cacheKey) {
+        const tol = avgBeatDur * 0.15;
+        gridLockCacheRef.current = {
+          key: cacheKey,
+          scores: tracks.map(t => {
+            if (!t.notes.length) return 0;
+            let hit = 0;
+            for (const n of t.notes)
+              if (mb.some(b => Math.abs(n.time - b) < tol)) hit++;
+            return hit / t.notes.length;
+          }),
+        };
+      }
+      gridLockScores = gridLockCacheRef.current.scores;
+    }
+
+    const trackColors = midiTrackColorsRef.current;
+    const stats       = midiTrackStatsRef.current;
+    const solo        = soloTrackIndexRef.current;
+
+    const ctx2 = ctx;
+    function drawTrackNotes(ti: number, color: string) {
+      const st  = stats[ti];
+      const densityFactor = opts.densityWeight && st ? 0.15 + st.density * 0.85 : 1.0;
+      const glScore  = gridLockScores[ti] ?? 0;
+      const glBoost  = opts.gridLock ? 0.3 + glScore * 1.4 : 1.0;
+
+      for (const note of tracks[ti].notes) {
+        const t0 = hasWarp ? warpMidiTime(note.time) : note.time;
+        const t1 = hasWarp ? warpMidiTime(note.time + note.dur) : note.time + note.dur;
+        if (t1 < tStart || t0 > tEnd) continue;
+        const durAudio = t1 - t0;
+        const x = t0 * pxPerSec - scrollLeft;
+        const w = Math.max(2, (t1 - t0) * pxPerSec - 1);
+        const y = (maxP - note.pitch) * noteH;
+
+        // Height: compress long sustained notes
+        let h = Math.max(1, noteH - 1);
+        if (opts.compressSustain && durAudio > avgBeatDur * 1.5)
+          h = Math.max(1, Math.round(h * 0.4));
+
+        // Alpha
+        let alpha = opts.velocityAlpha
+          ? 0.05 + Math.pow(note.vel, 1.8) * 0.9
+          : 0.45 + note.vel * 0.55;
+        if (opts.durationAlpha && durAudio > 0.25)
+          alpha *= Math.min(1, 0.25 / durAudio);
+        alpha *= densityFactor * glBoost;
+        alpha  = Math.max(0.03, Math.min(1, alpha));
+
+        ctx2.globalAlpha = alpha;
+        ctx2.fillStyle   = color;
+        ctx2.fillRect(x, y, w, h);
+      }
+    }
+
+    // Pass 1 — non-piano tracks (lighter blending)
+    ctx.globalCompositeOperation = 'lighter';
+    for (let ti = 0; ti < tracks.length; ti++) {
+      if (solo !== null && ti !== solo) continue;
+      if (!tracks[ti].isPiano)
+        drawTrackNotes(ti, trackColors[ti] ?? `hsl(${PALETTE_HUES[ti % PALETTE_HUES.length]},70%,55%)`);
+    }
+    // Pass 2 — piano on top
+    for (let ti = 0; ti < tracks.length; ti++) {
+      if (solo !== null && ti !== solo) continue;
+      if (tracks[ti].isPiano) drawTrackNotes(ti, '#ffffff');
+    }
+
+    // Pass 3 — attack flash (source-over so onsets are always crisp)
+    if (opts.attackFlash) {
+      ctx.globalCompositeOperation = 'source-over';
+      for (let ti = 0; ti < tracks.length; ti++) {
+        if (solo !== null && ti !== solo) continue;
+        const fc = tracks[ti].isPiano ? '#ffffff' : (trackColors[ti] ?? '#fff');
+        for (const note of tracks[ti].notes) {
+          const t0 = hasWarp ? warpMidiTime(note.time) : note.time;
+          if (t0 < tStart || t0 > tEnd) continue;
+          const x = t0 * pxPerSec - scrollLeft;
+          ctx.globalAlpha = 0.5 + note.vel * 0.5;
+          ctx.fillStyle   = fc;
+          ctx.fillRect(x, (maxP - note.pitch) * noteH, 2, Math.max(1, noteH - 1));
+        }
+      }
+    }
+
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    // MIDI beat markers
+    const selBeat = selectedMidiBeatRef.current;
+    for (const bt of mb) {
+      const t = hasWarp ? warpMidiTime(bt) : bt;
+      const x = t * pxPerSec - scrollLeft;
+      if (x < -4 || x > width + 4) continue;
+      const isSel = selBeat !== null && Math.abs(bt - selBeat) < 0.001;
+
+      if (isSel) {
+        // Glow pass behind the selected marker
+        ctx.strokeStyle = '#ff8855';
+        ctx.lineWidth = 7;
+        ctx.globalAlpha = 0.18;
+        ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, height); ctx.stroke();
+        ctx.lineWidth = 3;
+        ctx.globalAlpha = 0.25;
+        ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, height); ctx.stroke();
+      }
+
+      ctx.strokeStyle = isSel ? '#ff7755' : '#ffffff';
+      ctx.lineWidth   = isSel ? 2 : 1;
+      ctx.globalAlpha = isSel ? 1.0 : 0.4;
+      ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, height); ctx.stroke();
+      // handle triangle at top
+      ctx.fillStyle   = ctx.strokeStyle;
+      ctx.globalAlpha = isSel ? 1 : 0.6;
+      ctx.beginPath();
+      ctx.moveTo(x - (isSel ? 6 : 4), 0);
+      ctx.lineTo(x + (isSel ? 6 : 4), 0);
+      ctx.lineTo(x, isSel ? 9 : 7);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // MIDI cursor
+    const cursorT = hasWarp ? warpMidiTime(midiCursorRef.current) : midiCursorRef.current;
+    const cx = cursorT * pxPerSec - scrollLeft;
+    if (cx >= 0 && cx <= width) {
+      ctx.strokeStyle = selectedTimelineRef.current === 'midi' ? '#44ff88' : '#ffdd44';
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, height); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawPianoKeyboard() {
+    const canvas = pianoKeyCanvasRef.current;
+    if (!canvas) return;
+    const { width, height } = canvas;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#080810';
+    ctx.fillRect(0, 0, width, height);
+
+    const { min: minP, max: maxP } = midiRangeRef.current;
+    const noteRange = maxP - minP + 1;
+    const noteH = height / noteRange;
+
+    for (let p = minP; p <= maxP; p++) {
+      const pc = p % 12;
+      const isBlack = BLACK_PCS.has(pc);
+      const y = (maxP - p) * noteH;
+      ctx.fillStyle = isBlack ? '#1a1a2e' : '#d0d0e0';
+      ctx.fillRect(0, y, width - 1, noteH);
+      if (pc === 0) {
+        const oct = Math.floor(p / 12) - 1;
+        ctx.fillStyle = '#606080';
+        ctx.font = `${Math.min(9, Math.floor(noteH * 3))}px sans-serif`;
+        ctx.textAlign = 'right';
+        ctx.fillText(`C${oct}`, width - 3, y + noteH - 1);
+      }
+    }
+    // Right border
+    ctx.strokeStyle = '#2a2a3e';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(width - 0.5, 0); ctx.lineTo(width - 0.5, height); ctx.stroke();
+  }
+
+  // ── MIDI playback engine ───────────────────────────────────────────────────
+  const MIDI_LOOKAHEAD = 0.4;  // seconds to schedule ahead
+  const MIDI_TICK_MS   = 100;  // scheduler interval
+
+  function getMidiCtx(): AudioContext & { masterOut?: AudioNode } {
+    if (!midiAudioCtxRef.current) {
+      const ctx = new AudioContext() as AudioContext & { masterOut?: AudioNode };
+      const comp = ctx.createDynamicsCompressor();
+      comp.threshold.value = -18;
+      comp.ratio.value = 4;
+      comp.connect(ctx.destination);
+      ctx.masterOut = comp;
+      midiAudioCtxRef.current = ctx;
+    }
+    if (midiAudioCtxRef.current.state === 'suspended') midiAudioCtxRef.current.resume();
+    return midiAudioCtxRef.current;
+  }
+
+  function scheduleMidiNote(ctx: AudioContext, out: AudioNode, pitch: number, vel: number, wallStart: number, dur: number) {
+    const freq = 440 * Math.pow(2, (pitch - 69) / 12);
+    const osc  = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = freq;
+    const amp = vel * 0.10;
+    const atk = Math.min(0.012, dur * 0.1);
+    const rel = Math.min(0.06, dur * 0.15);
+    gain.gain.setValueAtTime(0.0001, wallStart);
+    gain.gain.linearRampToValueAtTime(amp, wallStart + atk);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, amp * 0.55), wallStart + Math.min(0.18, dur * 0.45));
+    gain.gain.setValueAtTime(Math.max(0.0001, amp * 0.55), wallStart + dur - rel);
+    gain.gain.linearRampToValueAtTime(0.0001, wallStart + dur);
+    osc.connect(gain);
+    gain.connect(out);
+    osc.start(wallStart);
+    osc.stop(wallStart + dur + 0.02);
+    const entry = {
+      stop: (now: number) => {
+        try {
+          gain.gain.cancelScheduledValues(now);
+          gain.gain.setValueAtTime(gain.gain.value, now);
+          gain.gain.linearRampToValueAtTime(0.0001, now + 0.02);
+          osc.stop(now + 0.025);
+        } catch { /* already stopped */ }
+      },
+    };
+    midiActiveNodesRef.current.push(entry);
+    osc.onended = () => {
+      const arr = midiActiveNodesRef.current;
+      const i = arr.indexOf(entry);
+      if (i !== -1) arr.splice(i, 1);
+    };
+  }
+
+  function schedulePianoNote(ctx: AudioContext, out: AudioNode, pitch: number, vel: number, wallStart: number, dur: number) {
+    const freq = 440 * Math.pow(2, (pitch - 69) / 12);
+
+    // Master gain carries the piano envelope
+    const masterGain = ctx.createGain();
+    masterGain.connect(out);
+
+    // Brightness filter: wide open at attack, sweeps closed as note decays
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    const nyquist = ctx.sampleRate / 2 - 1;
+    const brightFreq = Math.min(nyquist, freq * 18);
+    const darkFreq   = Math.min(nyquist, Math.max(freq * 2.5, 1200));
+    filter.frequency.setValueAtTime(brightFreq, wallStart);
+    filter.frequency.exponentialRampToValueAtTime(darkFreq, wallStart + Math.min(0.5, dur * 0.5));
+    filter.connect(masterGain);
+
+    // Piano envelope: 3 ms hammer-strike attack → fast initial decay → slow sustain decay
+    const amp = vel * 0.055;
+    const decayEnd = Math.min(0.15, dur * 0.25);
+    const sustainAmp = Math.max(0.0001, amp * 0.38);
+    masterGain.gain.setValueAtTime(0.0001, wallStart);
+    masterGain.gain.linearRampToValueAtTime(amp, wallStart + 0.003);
+    masterGain.gain.exponentialRampToValueAtTime(sustainAmp, wallStart + decayEnd);
+    if (dur > decayEnd + 0.01) {
+      masterGain.gain.exponentialRampToValueAtTime(Math.max(0.0001, sustainAmp * 0.08), wallStart + dur);
+    }
+
+    // Harmonic series: sine partials with amplitude + decay rate falling off with number
+    // Higher harmonics also decay faster (piano inharmonicity approximation)
+    const partials: [number, number][] = [
+      [1, 1.00], [2, 0.50], [3, 0.22], [4, 0.12], [5, 0.06], [6, 0.03],
+    ];
+    const oscs: OscillatorNode[] = [];
+    for (const [n, relAmp] of partials) {
+      const osc  = ctx.createOscillator();
+      const hGain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq * n;
+      // Each partial decays proportionally faster as n increases
+      const partialDecay = Math.min(0.6, dur * 0.7) / n;
+      hGain.gain.setValueAtTime(relAmp, wallStart);
+      hGain.gain.exponentialRampToValueAtTime(Math.max(0.0001, relAmp * 0.05), wallStart + partialDecay);
+      osc.connect(hGain);
+      hGain.connect(filter);
+      osc.start(wallStart);
+      osc.stop(wallStart + dur + 0.08);
+      oscs.push(osc);
+    }
+
+    // Brief noise burst for the hammer-strike transient
+    const burstLen = Math.ceil(ctx.sampleRate * 0.012);
+    const noiseBuf = ctx.createBuffer(1, burstLen, ctx.sampleRate);
+    const nd = noiseBuf.getChannelData(0);
+    for (let i = 0; i < burstLen; i++) nd[i] = Math.random() * 2 - 1;
+    const noise = ctx.createBufferSource();
+    noise.buffer = noiseBuf;
+    const noiseBP = ctx.createBiquadFilter();
+    noiseBP.type = 'bandpass';
+    noiseBP.frequency.value = Math.min(nyquist, freq * 5);
+    noiseBP.Q.value = 0.8;
+    const noiseGain = ctx.createGain();
+    noiseGain.gain.setValueAtTime(vel * 0.035, wallStart);
+    noiseGain.gain.exponentialRampToValueAtTime(0.0001, wallStart + 0.018);
+    noise.connect(noiseBP);
+    noiseBP.connect(noiseGain);
+    noiseGain.connect(masterGain);
+    noise.start(wallStart);
+    noise.stop(wallStart + 0.02);
+
+    const entry = {
+      stop: (now: number) => {
+        try {
+          masterGain.gain.cancelScheduledValues(now);
+          masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+          masterGain.gain.linearRampToValueAtTime(0.0001, now + 0.025);
+          oscs.forEach(o => { try { o.stop(now + 0.03); } catch { /* already stopped */ } });
+        } catch { /* already stopped */ }
+      },
+    };
+    midiActiveNodesRef.current.push(entry);
+    oscs[0].onended = () => {
+      const arr = midiActiveNodesRef.current;
+      const i = arr.indexOf(entry);
+      if (i !== -1) arr.splice(i, 1);
+    };
+  }
+
+  function runMidiScheduler() {
+    const ctx = midiAudioCtxRef.current;
+    if (!ctx || !midiPlayingRef.current) return;
+    const out = ctx.masterOut!;
+    const elapsed      = ctx.currentTime - midiStartWallRef.current;
+    const audioNow     = midiStartAudioRef.current + elapsed;
+    const scheduleUpto = audioNow + MIDI_LOOKAHEAD;
+    const already      = midiScheduledToRef.current;
+    if (scheduleUpto <= already) return;
+    const solo = soloTrackIndexRef.current;
+    for (let ti = 0; ti < midiTracksRef.current.length; ti++) {
+      if (solo !== null && ti !== solo) continue;
+      for (const note of midiTracksRef.current[ti].notes) {
+        const noteAudioStart = warpMidiTime(note.time);
+        const noteAudioEnd   = warpMidiTime(note.time + note.dur);
+        if (noteAudioEnd < already) continue;
+        if (noteAudioStart >= scheduleUpto) break; // warp is monotone so break is safe
+        if (noteAudioStart < already) continue;
+        const wallStart = midiStartWallRef.current + (noteAudioStart - midiStartAudioRef.current);
+        if (wallStart < ctx.currentTime - 0.01) continue;
+        const noteDur = Math.max(0.05, noteAudioEnd - noteAudioStart);
+        let stop: (now: number) => void;
+        if (midiTracksRef.current[ti].isPiano && globalPianoSampler?.isReady) {
+          stop = globalPianoSampler.scheduleNote(ctx, out, note.pitch, note.vel, wallStart, noteDur);
+        } else if (midiTracksRef.current[ti].isPiano) {
+          schedulePianoNote(ctx, out, note.pitch, note.vel, wallStart, noteDur);
+          continue; // schedulePianoNote pushes its own entry
+        } else {
+          scheduleMidiNote(ctx, out, note.pitch, note.vel, wallStart, noteDur);
+          continue; // scheduleMidiNote pushes its own entry
+        }
+        const entry = { stop };
+        midiActiveNodesRef.current.push(entry);
+      }
+    }
+    midiScheduledToRef.current = scheduleUpto;
+  }
+
+  const midiDispFrameRef = useRef(0);
+  function midiCursorLoop() {
+    const ctx = midiAudioCtxRef.current;
+    if (!ctx || !midiPlayingRef.current) return;
+    const elapsed  = ctx.currentTime - midiStartWallRef.current;
+    const audioNow = midiStartAudioRef.current + elapsed;
+    // Keep midiCursorRef in MIDI time so beat-tapping still works
+    midiCursorRef.current = audioTimeToMidiTime(audioNow);
+    drawPianoRoll();
+    midiDispFrameRef.current++;
+    if (midiDispFrameRef.current % 6 === 0) setMidiCursorDisp(midiCursorRef.current);
+    if (audioNow < warpMidiTime(midiDurationRef.current) + 1) {
+      midiCursorRafRef.current = requestAnimationFrame(midiCursorLoop);
+    } else {
+      midiPause();
+    }
+  }
+
+  async function midiPlay(from?: number) {
+    const ctx = getMidiCtx();
+
+    // Decode pre-fetched samples if piano is audible and samples aren't decoded yet.
+    // Fetch already started on MIDI load; this only runs the fast decode step.
+    const solo = soloTrackIndexRef.current;
+    const pianoVisible = midiTracksRef.current.some((t, i) =>
+      t.isPiano && (solo === null || solo === i)
+    );
+    if (pianoVisible && globalPianoSampler && !globalPianoSampler.isReady) {
+      try {
+        await globalPianoSampler.fetch(); // no-op if already fetched; waits if still in progress
+        await globalPianoSampler.decode(ctx);
+        setSamplerStatus('ready');
+      } catch {
+        setSamplerStatus('error');
+      }
+    }
+
+    const pos      = from ?? midiCursorRef.current;
+    const audioPos = warpMidiTime(pos);
+    midiStartPosRef.current    = pos;
+    midiStartAudioRef.current  = audioPos;
+    midiStartWallRef.current   = ctx.currentTime;
+    midiScheduledToRef.current = audioPos;
+    midiPlayingRef.current     = true;
+    setMidiPlaying(true);
+    if (midiSchedulerRef.current) clearInterval(midiSchedulerRef.current);
+    midiSchedulerRef.current = setInterval(runMidiScheduler, MIDI_TICK_MS);
+    runMidiScheduler();
+    if (midiCursorRafRef.current) cancelAnimationFrame(midiCursorRafRef.current);
+    midiCursorRafRef.current = requestAnimationFrame(midiCursorLoop);
+  }
+
+  function midiPause() {
+    const ctx = midiAudioCtxRef.current;
+    if (ctx && midiPlayingRef.current) {
+      const elapsed = ctx.currentTime - midiStartWallRef.current;
+      midiCursorRef.current = audioTimeToMidiTime(midiStartAudioRef.current + elapsed);
+    }
+    // Kill all scheduled notes immediately with a short fade to avoid clicks
+    if (ctx) {
+      const now = ctx.currentTime;
+      for (const entry of midiActiveNodesRef.current) entry.stop(now);
+    }
+    midiActiveNodesRef.current = [];
+    midiPlayingRef.current = false;
+    setMidiPlaying(false);
+    setMidiCursorDisp(midiCursorRef.current);
+    if (midiSchedulerRef.current) { clearInterval(midiSchedulerRef.current); midiSchedulerRef.current = null; }
+    if (midiCursorRafRef.current) { cancelAnimationFrame(midiCursorRafRef.current); midiCursorRafRef.current = null; }
+    drawPianoRoll();
+  }
+
+  function midiTogglePlay() {
+    if (midiPlayingRef.current) midiPause(); else midiPlay();
+  }
+
+  function midiSeekTo(midiT: number) {
+    const wasPlaying = midiPlayingRef.current;
+    if (wasPlaying) midiPause();
+    midiCursorRef.current = Math.max(0, midiT);
+    drawPianoRoll();
+    if (wasPlaying) midiPlay(midiCursorRef.current);
+  }
+
+  function midiTapBeat() {
+    const t = midiCursorRef.current;
+    if (t < 0) return;
+    const next = [...midiBeatsRef.current, t].sort((a, b) => a - b);
+    midiBeatsRef.current = next;
+    onMidiBeatsChangeRef.current(next);
+    drawPianoRoll();
+  }
+
+  // Piecewise-linear warp: MIDI time → audio time
+  function warpMidiTime(mt: number): number {
+    const mb = midiBeatsRef.current;
+    const ab = beatsRef.current;
+    const n  = Math.min(mb.length, ab.length);
+    if (n === 0) return mt;
+    if (n === 1) return ab[0] + (mt - mb[0]);
+    if (mt <= mb[0]) {
+      const ratio = (ab[1] - ab[0]) / (mb[1] - mb[0]);
+      return ab[0] + (mt - mb[0]) * ratio;
+    }
+    if (mt >= mb[n - 1]) {
+      const ratio = (ab[n - 1] - ab[n - 2]) / (mb[n - 1] - mb[n - 2]);
+      return ab[n - 1] + (mt - mb[n - 1]) * ratio;
+    }
+    for (let i = 0; i < n - 1; i++) {
+      if (mt >= mb[i] && mt < mb[i + 1]) {
+        const t = (mt - mb[i]) / (mb[i + 1] - mb[i]);
+        return ab[i] + t * (ab[i + 1] - ab[i]);
+      }
+    }
+    return mt;
+  }
+
+  // Piecewise-linear inverse: audio time → MIDI time
+  function audioTimeToMidiTime(at: number): number {
+    const mb = midiBeatsRef.current;
+    const ab = beatsRef.current;
+    const n  = Math.min(mb.length, ab.length);
+    if (n === 0) return at;
+    if (n === 1) return mb[0] + (at - ab[0]);
+    if (at <= ab[0]) {
+      const ratio = (mb[1] - mb[0]) / (ab[1] - ab[0]);
+      return mb[0] + (at - ab[0]) * ratio;
+    }
+    if (at >= ab[n - 1]) {
+      const ratio = (mb[n - 1] - mb[n - 2]) / (ab[n - 1] - ab[n - 2]);
+      return mb[n - 1] + (at - ab[n - 1]) * ratio;
+    }
+    for (let i = 0; i < n - 1; i++) {
+      if (at >= ab[i] && at < ab[i + 1]) {
+        const t = (at - ab[i]) / (ab[i + 1] - ab[i]);
+        return mb[i] + t * (mb[i + 1] - mb[i]);
+      }
+    }
+    return at;
+  }
+
+  // ── Drag-to-pan ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    const el = containerRef.current!;
+    if (!el) return;
+
+    let startX = 0;
+    let startScrollLeft = 0;
+    let panning = false;
+    let started = false; // only activate for pointers that began on this container
+
+    function getScrollEl() {
+      const ws = wsRef.current;
+      return ws ? (ws.getWrapper().parentElement as HTMLElement) : null;
+    }
+
+    function onPointerDown(e: PointerEvent) {
+      if (e.button !== 0) return;
+      started = true;
+      startX = e.clientX;
+      startScrollLeft = getScrollEl()?.scrollLeft ?? 0;
+      panning = false;
+    }
+
+    function onPointerMove(e: PointerEvent) {
+      if (!started || !(e.buttons & 1)) return;
+      const dx = e.clientX - startX;
+      if (!panning && Math.abs(dx) > 4) {
+        panning = true;
+        regionJustClickedRef.current = true;
+        wsRef.current?.setOptions({ interact: false });
+        el.style.cursor = 'grabbing';
+      }
+      if (panning) {
+        const scrollEl = getScrollEl();
+        if (scrollEl) scrollEl.scrollLeft = startScrollLeft - dx;
+      }
+    }
+
+    function onPointerUp() {
+      if (panning) {
+        el.style.cursor = '';
+        setTimeout(() => {
+          wsRef.current?.setOptions({ interact: true });
+          regionJustClickedRef.current = false;
+        }, 50);
+      }
+      panning = false;
+      started = false;
+    }
+
+    el.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    return () => {
+      el.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+    };
+  }, []);
+
+  // ── Wheel-to-zoom (separate effect so HMR re-attaches it without restart) ──
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    function onWheel(e: WheelEvent) {
+      if (Math.abs(e.deltaX) * 3 > Math.abs(e.deltaY)) return; // not strongly vertical → pan
+      e.preventDefault();
+      const fit = fitPxPerSecRef.current;
+      if (fit === 0) return;
+      const factor = e.deltaY < 0 ? 1 / ZOOM_STEP : ZOOM_STEP;
+      const next = Math.max(fit, Math.min(zoomPxPerSecRef.current * factor, fit * ZOOM_MAX_MULTIPLIER));
+      zoomPxPerSecRef.current = next;
+      setZoomPxPerSec(next);
+      // rAF-throttle: re-render at most once per frame instead of waiting for idle debounce
+      if (zoomRafRef.current === null) {
+        zoomRafRef.current = requestAnimationFrame(() => {
+          zoomRafRef.current = null;
+          const z = zoomPxPerSecRef.current;
+          wsRef.current?.zoom(z);
+          bassWsRef.current?.zoom(z);
+          drawSpectrogram();
+          drawPianoRoll();
+        });
+      }
+    }
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
 
   // ── Load audio via Rust engine ─────────────────────────────────────────────
   useEffect(() => {
@@ -195,6 +1583,8 @@ export default function WaveformEditor({
     setPlaying(false);
     playingRef.current = false;
     setPcmReady(false);
+    specDataRef.current = null;
+    scrollLeftRef.current = 0;
 
     (async () => {
       try {
@@ -215,8 +1605,49 @@ export default function WaveformEditor({
           invoke("set_stretches_audio", { stretches: stretchesRef.current }).catch(console.error);
         }
 
+        // Decode spectrogram base64 into a Uint8Array
+        const raw = atob(result.spectrogram);
+        const specBytes = new Uint8Array(raw.length);
+        for (let i = 0; i < raw.length; i++) specBytes[i] = raw.charCodeAt(i);
+
+        // Per-frequency-bin contrast stretching: normalize each bin to its own
+        // observed min/max so quiet high-frequency content isn't lost in black.
+        // Skip bins with little activity (range ≤ 20) to avoid amplifying silence.
+        {
+          const cols = result.spec_cols;
+          const bins = result.spec_bins;
+          const binMin = new Uint8Array(bins).fill(255);
+          const binMax = new Uint8Array(bins);
+          for (let c = 0; c < cols; c++) {
+            const base = c * bins;
+            for (let b = 0; b < bins; b++) {
+              const v = specBytes[base + b];
+              if (v < binMin[b]) binMin[b] = v;
+              if (v > binMax[b]) binMax[b] = v;
+            }
+          }
+          for (let c = 0; c < cols; c++) {
+            const base = c * bins;
+            for (let b = 0; b < bins; b++) {
+              const range = binMax[b] - binMin[b];
+              if (range > 20)
+                specBytes[base + b] = Math.round((specBytes[base + b] - binMin[b]) / range * 255);
+            }
+          }
+        }
+
+        specDataRef.current = specBytes;
+        specColsRef.current = result.spec_cols;
+        specBinsRef.current = result.spec_bins;
+        specColsPerSecRef.current = result.spec_cols_per_sec;
+
         const channelData = result.peaks.map(ch => new Float32Array(ch));
         await ws.load("", channelData, result.duration);
+
+        if (bassWsRef.current && result.bass_peaks?.length) {
+          const bassData = result.bass_peaks.map(ch => new Float32Array(ch));
+          bassWsRef.current.load("", bassData, result.duration).catch(() => {});
+        }
       } catch (e) {
         if (!cancelled) setLoadError(String(e));
       }
@@ -228,14 +1659,49 @@ export default function WaveformEditor({
   // ── Listen to Rust decode-progress and pcm-ready events ───────────────────
   useEffect(() => {
     const u1 = listen<number>("load-progress", (ev) => setLoadProgress(ev.payload));
-    const u2 = listen("pcm-ready", () => setPcmReady(true));
-    return () => { u1.then(fn => fn()); u2.then(fn => fn()); };
+    const u2 = listen("pcm-ready", () => { setPcmReady(true); setLoadPhase(""); });
+    const u3 = listen<number>("export-progress", (ev) => {
+      const pct = ev.payload;
+      setExportProgress(pct);
+      if (pct >= 100) setTimeout(() => setExportProgress(null), 600);
+    });
+    const u4 = listen<string>("load-phase", (ev) => setLoadPhase(ev.payload));
+    return () => { u1.then(fn => fn()); u2.then(fn => fn()); u3.then(fn => fn()); u4.then(fn => fn()); };
   }, []);
+
+  // ── Beat tick sound ───────────────────────────────────────────────────────
+  function playBeatTick() {
+    if (!audioCtxRef.current) audioCtxRef.current = new AudioContext();
+    const ctx = audioCtxRef.current;
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(1200, now);
+    osc.frequency.exponentialRampToValueAtTime(400, now + 0.03);
+    gain.gain.setValueAtTime(0.35, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
+    osc.start(now);
+    osc.stop(now + 0.07);
+  }
 
   // ── Listen to Rust position events ────────────────────────────────────────
   useEffect(() => {
     const unlisten = listen<PositionEvent>("audio-position", (ev) => {
       const { t, playing: p } = ev.payload;
+
+      // Beat tick: detect when playback crosses a beat timestamp.
+      // Skip if position jumped > 0.1 s (seek) to avoid spurious ticks.
+      const last = lastAudioPosRef.current;
+      if (p && playBeatsRef.current && last >= 0 && t - last < 0.1 && t > last) {
+        const crossed = beatsRef.current.filter(bt => bt > last && bt <= t);
+        if (crossed.length > 0) playBeatTick();
+      }
+      lastAudioPosRef.current = t;
+
       setCurrentTime(t);
       currentTimeRef.current = t;
       setPlaying(p);
@@ -244,7 +1710,9 @@ export default function WaveformEditor({
       const ws = wsRef.current;
       const dur = durationRef.current;
       if (ws && dur > 0) {
-        ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
+        const pos = Math.max(0, Math.min(t / dur, 1));
+        ws.seekTo(pos);
+        bassWsRef.current?.seekTo(pos);
       }
     });
     return () => { unlisten.then(fn => fn()); };
@@ -265,47 +1733,42 @@ export default function WaveformEditor({
       const isInput = tag === "INPUT" || tag === "TEXTAREA";
 
       if (e.key === "Shift") { shiftHeldRef.current = true; return; }
+      if (e.key === "Meta" || e.key === "Control") { cmdHeldRef.current = true; return; }
       if (isInput) return;
-
-      if (e.code === "KeyR" && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        rerenderWaveform();
-        return;
-      }
 
       if (e.code === "Space") {
         e.preventDefault();
-        togglePlayPause();
-        return;
-      }
-
-      if (e.code === "Escape") {
-        if (stretchAnchorRef.current !== null) {
-          stretchAnchorRef.current = null;
-          setStretchAnchor(null);
-        } else if (stretchModeRef.current) {
-          stretchModeRef.current = false;
-          setStretchMode(false);
+        if (selectedTimelineRef.current === 'midi') {
+          midiTogglePlay();
+        } else {
+          togglePlayPause();
         }
         return;
       }
 
       if (e.code === "KeyT") {
         e.preventDefault();
-        const next = !stretchModeRef.current;
-        stretchModeRef.current = next;
-        setStretchMode(next);
-        if (!next) { stretchAnchorRef.current = null; setStretchAnchor(null); }
+        midiTapBeat();
         return;
       }
 
-      if (e.code === "KeyS" && stretchModeRef.current && stretchAnchorRef.current !== null) {
+      if (e.code === "Escape") {
+        selectionRef.current = null;
+        setSelection(null);
+        return;
+      }
+
+      if (e.code === "KeyS") {
         e.preventDefault();
-        const t = currentTimeRef.current;
-        const a = stretchAnchorRef.current;
-        const start = Math.min(a, t);
-        const end = Math.max(a, t);
-        if (end - start > 0.01) setStretchModal({ start, end });
+        const sel = selectionRef.current;
+        if (sel) {
+          const overlaps = stretchesRef.current.some(s => sel.end > s.start && sel.start < s.end);
+          if (!overlaps) setStretchModal({ start: sel.start, end: sel.end });
+        } else {
+          const t = currentTimeRef.current;
+          const active = stretchesRef.current.find(s => t >= s.start && t <= s.end);
+          if (active) setStretchModal({ start: active.start, end: active.end, existingFactor: active.factor });
+        }
         return;
       }
 
@@ -322,28 +1785,142 @@ export default function WaveformEditor({
         return;
       }
 
-      if ((e.code === "Delete" || e.code === "Backspace") && selectedBeatTimeRef.current !== null) {
+      if (e.code === "ArrowLeft" || e.code === "ArrowRight") {
+        const sel = selectionRef.current;
+        const selBeat = selectedBeatTimeRef.current;
+        if (!sel && selBeat === null) return;
         e.preventDefault();
-        const sel = selectedBeatTimeRef.current;
-        const updated = beatsRef.current.filter(t => Math.abs(t - sel) > 0.001);
-        selectedBeatTimeRef.current = null;
-        setSelectedBeatTime(null);
-        onBeatsChangeRef.current(updated);
+        const nudge = (e.shiftKey ? 0.1 : 0.01) * (e.code === "ArrowRight" ? 1 : -1);
+
+        if (sel) {
+          const updated = beatsRef.current
+            .map(b => (b >= sel.start && b <= sel.end) ? Math.max(0, b + nudge) : b)
+            .sort((a, b) => a - b);
+          onBeatsChangeRef.current(updated);
+          const newSel = { start: sel.start + nudge, end: sel.end + nudge };
+          selectionRef.current = newSel;
+          setSelection(newSel);
+        } else if (selBeat !== null) {
+          const newTime = Math.max(0, selBeat + nudge);
+          const updated = beatsRef.current
+            .map(b => Math.abs(b - selBeat) < 0.001 ? newTime : b)
+            .sort((a, b) => a - b);
+          selectedBeatTimeRef.current = newTime;
+          setSelectedBeatTime(newTime);
+          onBeatsChangeRef.current(updated);
+        }
         return;
+      }
+
+      if (e.code === "BracketLeft" || e.code === "BracketRight") {
+        const selBeat = selectedBeatTimeRef.current;
+        if (selBeat === null) return;
+        e.preventDefault();
+
+        const ab = beatsRef.current.slice();
+        const idx = ab.findIndex(b => Math.abs(b - selBeat) < 0.001);
+        if (idx < 0) return;
+
+        const MIN_GAP = 60 / 400; // 0.15 s — maximum 400 BPM spacing used during cascade
+
+        if (e.code === "BracketLeft") {
+          if (idx < 1 || idx >= ab.length - 1) return; // need a beat on each side
+          const interval = ab[idx + 1] - ab[idx];
+          ab[idx - 1] = Math.max(0, ab[idx] - interval);
+          // Cascade: push any beat that is now ≤ its left neighbour
+          for (let j = idx - 1; j >= 1; j--) {
+            if (ab[j] <= ab[j - 1]) ab[j - 1] = Math.max(0, ab[j] - MIN_GAP);
+            else break;
+          }
+          const newSel = ab[idx - 1];
+          selectedBeatTimeRef.current = newSel;
+          setSelectedBeatTime(newSel);
+          selectedMidiBeatRef.current = null;
+          setSelectedMidiBeat(null);
+          onBeatsChangeRef.current(ab);
+          scrollToBeat(newSel);
+
+        } else {
+          if (idx >= ab.length - 2) return; // need beats at i+1 and i+2
+          const interval = ab[idx + 1] - ab[idx];
+          ab[idx + 2] = ab[idx + 1] + interval;
+          // Cascade: push any beat that is now ≥ its right neighbour
+          for (let j = idx + 2; j < ab.length - 1; j++) {
+            if (ab[j] >= ab[j + 1]) ab[j + 1] = Math.min(durationRef.current, ab[j] + MIN_GAP);
+            else break;
+          }
+          const newSel = ab[idx + 1];
+          selectedBeatTimeRef.current = newSel;
+          setSelectedBeatTime(newSel);
+          selectedMidiBeatRef.current = null;
+          setSelectedMidiBeat(null);
+          onBeatsChangeRef.current(ab);
+          scrollToBeat(newSel);
+        }
+        return;
+      }
+
+      if (e.code === "Delete" || e.code === "Backspace") {
+        if (selectedMidiBeatRef.current !== null) {
+          e.preventDefault();
+          const sel = selectedMidiBeatRef.current;
+          const next = midiBeatsRef.current.filter(t => Math.abs(t - sel) > 0.001);
+          midiBeatsRef.current = next;
+          selectedMidiBeatRef.current = null;
+          onMidiBeatsChangeRef.current(next);
+          setSelectedMidiBeat(null);
+          drawPianoRoll();
+          return;
+        }
+        if (selectedBeatTimeRef.current !== null) {
+          e.preventDefault();
+          const sel = selectedBeatTimeRef.current;
+          const updated = beatsRef.current.filter(t => Math.abs(t - sel) > 0.001);
+          selectedBeatTimeRef.current = null;
+          setSelectedBeatTime(null);
+          onBeatsChangeRef.current(updated);
+          return;
+        }
       }
     }
 
     function onKeyUp(e: KeyboardEvent) {
       if (e.key === "Shift") shiftHeldRef.current = false;
+      if (e.key === "Meta" || e.key === "Control") cmdHeldRef.current = false;
+    }
+
+    function onBlur() {
+      shiftHeldRef.current = false;
+      cmdHeldRef.current = false;
     }
 
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
     };
   }, []);
+
+  // ── Scroll to keep a beat time within the middle 50% of the viewport ──────
+  function scrollToBeat(beatTime: number) {
+    const ws = wsRef.current;
+    if (!ws) return;
+    const scrollEl = ws.getWrapper().parentElement as HTMLElement | null;
+    if (!scrollEl) return;
+    const containerWidth = containerRef.current?.clientWidth ?? scrollEl.clientWidth;
+    const beatPx = beatTime * zoomPxPerSecRef.current;
+    const viewportX = beatPx - scrollLeftRef.current;
+    let newScrollLeft: number | null = null;
+    if (viewportX < 0.25 * containerWidth)
+      newScrollLeft = beatPx - 0.25 * containerWidth;
+    else if (viewportX > 0.75 * containerWidth)
+      newScrollLeft = beatPx - 0.75 * containerWidth;
+    if (newScrollLeft !== null)
+      scrollEl.scrollLeft = Math.max(0, newScrollLeft);
+  }
 
   // ── Seek helper ───────────────────────────────────────────────────────────
   // Updates WaveSurfer cursor immediately (no round-trip) AND notifies Rust.
@@ -361,7 +1938,23 @@ export default function WaveformEditor({
     if (playingRef.current) {
       invoke("pause_audio").catch(console.error);
     } else {
-      invoke("play_audio").catch(console.error);
+      // Seek before play to avoid a race where a recent click-to-seek hasn't
+      // reached Rust yet and play_audio would start from the wrong position.
+      invoke("seek_audio", { t: currentTimeRef.current })
+        .then(() => invoke("play_audio"))
+        .catch(console.error);
+    }
+  }
+
+  function togglePlayBoth() {
+    if (playingRef.current || midiPlayingRef.current) {
+      invoke("pause_audio").catch(console.error);
+      midiPause();
+    } else {
+      invoke("seek_audio", { t: currentTimeRef.current })
+        .then(() => invoke("play_audio"))
+        .catch(console.error);
+      midiPlay();
     }
   }
 
@@ -389,32 +1982,9 @@ export default function WaveformEditor({
 
   // ── Bake (Cmd+R) ──────────────────────────────────────────────────────────
   // Bake is purely a high-quality file export. The engine already plays the
-  // Rubber Band offline result from its warped buffer — quality is identical.
-  async function rerenderWaveform() {
-    if (rerendering || stretches.length === 0) return;
-
-    let savePath = bakedWavPath;
-    if (!savePath) {
-      savePath = await saveDialog({
-        title: "Save Baked Audio (WAV)",
-        filters: [{ name: "WAV Audio", extensions: ["wav"] }],
-        defaultPath: mp3Path.replace(/\.mp3$/i, "_baked.wav"),
-      }) ?? undefined;
-      if (!savePath) return;
-    }
-
-    setRerendering(true);
-    try {
-      await invoke("bake_audio", { mp3Path, stretches, outputPath: savePath });
-      onBakedWavPathChange(savePath);
-    } finally {
-      setRerendering(false);
-    }
-  }
-
   // ── Export to MP3 ─────────────────────────────────────────────────────────
   async function handleExport() {
-    if (exporting) return;
+    if (exportProgress !== null) return;
     setExportError(null);
     const outPath = await saveDialog({
       title: "Export as MP3",
@@ -423,17 +1993,16 @@ export default function WaveformEditor({
     });
     if (!outPath) return;
 
-    setExporting(true);
+    setExportProgress(0);
     try {
       await invoke("export_mp3", { mp3Path, stretches, outputPath: outPath });
     } catch (e) {
       setExportError(String(e));
-    } finally {
-      setExporting(false);
+      setExportProgress(null);
     }
   }
 
-  // ── Stretch modal confirm ──────────────────────────────────────────────────
+  // ── Stretch modal confirm / remove ────────────────────────────────────────
   function handleStretchConfirm(factor: number) {
     if (!stretchModal) return;
     const { start, end } = stretchModal;
@@ -442,72 +2011,195 @@ export default function WaveformEditor({
       .sort((a, b) => a.start - b.start);
     onStretchesChangeRef.current(updated);
     setStretchModal(null);
-    stretchAnchorRef.current = null;
-    setStretchAnchor(null);
+    setSelection(null);
+    selectionRef.current = null;
   }
 
-  // ── Beat region sync ───────────────────────────────────────────────────────
-  useEffect(() => {
-    const rp = regionsRef.current;
-    if (!rp || !ready) return;
+  function handleStretchRemove() {
+    if (!stretchModal) return;
+    const { start, end } = stretchModal;
+    const updated = stretchesRef.current.filter(
+      s => Math.abs(s.start - start) > 0.001 || Math.abs(s.end - end) > 0.001
+    );
+    onStretchesChangeRef.current(updated);
+    setStretchModal(null);
+  }
 
-    rp.getRegions().filter(r => r.id.startsWith("beat-")).forEach(r => r.remove());
+  // ── Beat markers in beats strip ───────────────────────────────────────────
+  useEffect(() => {
+    const inner = beatsStripInnerRef.current;
+    if (!inner || !ready) return;
+
+    inner.innerHTML = '';
+    beatLabelElsRef.current.clear();
+    inner.style.width = `${Math.max(durationRef.current * zoomPxPerSecRef.current, 1)}px`;
 
     beats.forEach((t, i) => {
       const bpm = i < beats.length - 1 ? 60 / (beats[i + 1] - t) : null;
       const isSelected = selectedBeatTime !== null && Math.abs(t - selectedBeatTime) < 0.001;
 
-      const labelEl = document.createElement("div");
-      labelEl.className = "beat-label";
-      if (bpm !== null) labelEl.textContent = bpm.toFixed(1);
-
-      const region: Region = rp.addRegion({
-        id: `beat-${t}`,
-        start: t,
-        end: t + BEAT_WIDTH_S,
-        color: isSelected ? BEAT_COLOR_SELECTED : BEAT_COLOR,
-        drag: true,
-        resize: false,
-        content: labelEl,
+      const markerEl = document.createElement('div');
+      markerEl.dataset.beatTime = String(t);
+      Object.assign(markerEl.style, {
+        position: 'absolute', top: '0', left: `${t * zoomPxPerSecRef.current}px`,
+        width: '8px', height: '100%', cursor: 'grab',
+        transform: 'translateX(-4px)',
       });
 
-      region.on("click", (e) => {
+      const normalColor = isSelected ? 'rgba(255,100,50,1)' : 'rgba(239,68,68,0.9)';
+      const tickEl = document.createElement('div');
+      Object.assign(tickEl.style, {
+        position: 'absolute', top: '0', left: '3px',
+        width: isSelected ? '3px' : '2px',
+        height: isSelected ? '100%' : '8px',
+        borderRadius: '1px',
+        background: normalColor, pointerEvents: 'none',
+        ...(isSelected && {
+          boxShadow: '0 0 6px 2px rgba(255,100,50,0.7), 0 0 2px 1px rgba(255,180,100,0.5)',
+        }),
+      });
+      markerEl.appendChild(tickEl);
+
+      const labelEl = document.createElement('div');
+      Object.assign(labelEl.style, {
+        position: 'absolute', top: '10px', left: '4px',
+        fontSize: '9px', fontFamily: '"SF Mono","Fira Code",monospace',
+        color: 'rgba(251,191,36,0.9)', whiteSpace: 'nowrap',
+        pointerEvents: 'none', lineHeight: '1',
+      });
+      if (bpm !== null) {
+        labelEl.textContent = String(Math.round(bpm));
+        beatLabelElsRef.current.set(t, labelEl);
+      }
+      markerEl.appendChild(labelEl);
+
+      markerEl.addEventListener('pointerover', () => { tickEl.style.background = 'rgba(255,140,80,1)'; });
+      markerEl.addEventListener('pointerout',  () => { tickEl.style.background = normalColor; });
+
+      markerEl.addEventListener('pointerdown', (e: PointerEvent) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
         e.stopPropagation();
         regionJustClickedRef.current = true;
-        setTimeout(() => { regionJustClickedRef.current = false; }, 50);
-        selectedBeatTimeRef.current = t;
-        setSelectedBeatTime(t);
+
+        const startClientX = e.clientX;
+        const startPixel = t * zoomPxPerSecRef.current;
+        let dragging = false;
+        let newTime = t;
+
+        function onMove(ev: PointerEvent) {
+          const dx = ev.clientX - startClientX;
+          if (!dragging && Math.abs(dx) > 3) {
+            dragging = true;
+            markerEl.style.cursor = 'grabbing';
+          }
+          if (dragging) {
+            newTime = Math.max(0, Math.min((startPixel + dx) / zoomPxPerSecRef.current, durationRef.current));
+            markerEl.style.left = `${newTime * zoomPxPerSecRef.current}px`;
+
+            // Update BPM labels in real-time
+            const ab = beatsRef.current;
+            const idx = ab.findIndex(b => Math.abs(b - t) < 0.001);
+
+            // This beat's label — BPM to the next beat, moved lower to clear the cursor
+            if (bpm !== null && idx >= 0 && idx < ab.length - 1) {
+              const interval = ab[idx + 1] - newTime;
+              if (interval > 0.001) labelEl.textContent = String(Math.round(60 / interval));
+              labelEl.style.top = '16px';
+            }
+
+            // Previous beat's label — BPM from prev beat to here
+            if (idx > 0) {
+              const prevLabel = beatLabelElsRef.current.get(ab[idx - 1]);
+              if (prevLabel) {
+                const interval = newTime - ab[idx - 1];
+                if (interval > 0.001) prevLabel.textContent = String(Math.round(60 / interval));
+              }
+            }
+          }
+        }
+
+        function onUp() {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          markerEl.style.cursor = 'grab';
+          if (bpm !== null) labelEl.style.top = '10px'; // restore label position
+          setTimeout(() => { regionJustClickedRef.current = false; }, 50);
+          if (dragging) {
+            const updated = beatsRef.current
+              .map(bt => Math.abs(bt - t) < 0.001 ? newTime : bt)
+              .sort((a, b) => a - b);
+            selectedBeatTimeRef.current = newTime;
+            selectedMidiBeatRef.current = null;
+            setSelectedMidiBeat(null);
+            onBeatsChangeRef.current(updated);
+          } else {
+            selectedBeatTimeRef.current = t;
+            setSelectedBeatTime(t);
+            selectedMidiBeatRef.current = null;
+            setSelectedMidiBeat(null);
+          }
+        }
+
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
       });
 
-      region.on("update-end", () => {
-        const newTime = region.start;
-        const updated = beatsRef.current
-          .map(bt => Math.abs(bt - t) < 0.001 ? newTime : bt)
-          .sort((a, b) => a - b);
-        selectedBeatTimeRef.current = newTime;
-        onBeatsChangeRef.current(updated);
-      });
+      inner.appendChild(markerEl);
     });
   }, [beats, ready, selectedBeatTime]);
 
-  // ── Stretch anchor region sync ─────────────────────────────────────────────
+  // ── Beat marker positions — update on zoom without recreating elements ─────
+  useEffect(() => {
+    const inner = beatsStripInnerRef.current;
+    if (!inner || !ready) return;
+    inner.style.width = `${Math.max(durationRef.current * zoomPxPerSec, 1)}px`;
+    inner.querySelectorAll<HTMLElement>('[data-beat-time]').forEach(el => {
+      const t = parseFloat(el.dataset.beatTime!);
+      el.style.left = `${t * zoomPxPerSec}px`;
+    });
+  }, [zoomPxPerSec, ready]);
+
+  // ── Beat label overlap culling ─────────────────────────────────────────────
+  // Greedy left-to-right pass: hide a label if it would overlap the previous
+  // visible one, using estimated label width + 20% margin.
+  useEffect(() => {
+    const CHAR_WIDTH_PX = 5.5; // 9px monospace
+    const MARGIN = 1.2;
+    let lastVisibleRight = -Infinity;
+    beats.forEach((t, i) => {
+      const el = beatLabelElsRef.current.get(t);
+      if (!el) return;
+      const bpm = i < beats.length - 1 ? 60 / (beats[i + 1] - t) : null;
+      const labelPx = t * zoomPxPerSec;
+      const estimatedWidth = bpm !== null ? String(Math.round(bpm)).length * CHAR_WIDTH_PX : 0;
+      if (labelPx >= lastVisibleRight) {
+        el.style.display = 'block';
+        lastVisibleRight = labelPx + estimatedWidth * MARGIN;
+      } else {
+        el.style.display = 'none';
+      }
+    });
+  }, [beats, zoomPxPerSec, ready]);
+
+  // ── Selection region sync ──────────────────────────────────────────────────
   useEffect(() => {
     const rp = regionsRef.current;
     if (!rp || !ready) return;
 
-    rp.getRegions().filter(r => r.id === ANCHOR_REGION_ID).forEach(r => r.remove());
+    rp.getRegions().filter(r => r.id === "selection").forEach(r => r.remove());
 
-    if (stretchAnchor !== null && stretchMode) {
+    if (selection) {
       rp.addRegion({
-        id: ANCHOR_REGION_ID,
-        start: stretchAnchor,
-        end: stretchAnchor + 0.001,
-        color: "rgba(59, 130, 246, 0.9)",
+        id: "selection",
+        start: selection.start,
+        end: selection.end,
+        color: "rgba(59, 130, 246, 0.18)",
         drag: false,
         resize: false,
       });
     }
-  }, [stretchAnchor, stretchMode, ready]);
+  }, [selection, ready]);
 
   // ── Stretch overlay regions sync ───────────────────────────────────────────
   useEffect(() => {
@@ -516,44 +2208,41 @@ export default function WaveformEditor({
 
     rp.getRegions().filter(r => r.id.startsWith("stretch-")).forEach(r => r.remove());
 
-    const isBaked = !!bakedWavPath;
-
     stretches.forEach((s, i) => {
       const pct = Math.round((s.factor - 1) * 100);
-
-      const displayStart = isBaked ? originalToStretched(s.start, stretches) : s.start;
-      const displayEnd = isBaked
-        ? displayStart + (s.end - s.start) * s.factor
-        : s.end;
-
       const label = document.createElement("div");
-      label.className = `stretch-label${isBaked ? " stretch-label-baked" : ""}`;
-      label.textContent = isBaked
-        ? `✓ ${pct >= 0 ? "+" : ""}${pct}%`
-        : `${pct >= 0 ? "+" : ""}${pct}%`;
+      label.className = "stretch-label";
+      label.textContent = `${pct >= 0 ? "+" : ""}${pct}%`;
 
       rp.addRegion({
         id: `stretch-${i}`,
-        start: displayStart,
-        end: displayEnd,
-        color: isBaked
-          ? "rgba(148, 163, 184, 0.10)"
-          : s.factor >= 1
-            ? "rgba(34, 197, 94, 0.12)"
-            : "rgba(239, 68, 68, 0.12)",
+        start: s.start,
+        end: s.end,
+        color: s.factor >= 1 ? "rgba(34, 197, 94, 0.12)" : "rgba(239, 68, 68, 0.12)",
         drag: false,
         resize: false,
         content: label,
       });
     });
-  }, [stretches, ready, bakedWavPath]);
+  }, [stretches, ready]);
 
   // ── Zoom helpers ───────────────────────────────────────────────────────────
   function applyZoom(next: number) {
     zoomPxPerSecRef.current = next;
     setZoomPxPerSec(next);
+    drawPianoRoll();
     if (zoomTimerRef.current) clearTimeout(zoomTimerRef.current);
-    zoomTimerRef.current = setTimeout(() => wsRef.current?.zoom(zoomPxPerSecRef.current), ZOOM_DEBOUNCE_MS);
+    zoomTimerRef.current = setTimeout(() => {
+      const z = zoomPxPerSecRef.current;
+      wsRef.current?.zoom(z);
+      bassWsRef.current?.zoom(z);
+      const fit = fitPxPerSecRef.current;
+      if (fit) {
+        const multiplier = z / fit;
+        const scrollT = scrollLeftRef.current / z;
+        localStorage.setItem(`beats_view_${mp3Path}`, JSON.stringify({ multiplier, scrollTime: scrollT }));
+      }
+    }, ZOOM_DEBOUNCE_MS);
   }
 
   const handleZoomIn = () => applyZoom(Math.min(zoomPxPerSec * ZOOM_STEP, fitPxPerSecRef.current * ZOOM_MAX_MULTIPLIER));
@@ -575,10 +2264,6 @@ export default function WaveformEditor({
     : zoomMultiplier >= 10 ? `${Math.round(zoomMultiplier)}×`
     : `${zoomMultiplier.toFixed(1)}×`;
 
-  const minBeatGap = beats.length > 1
-    ? Math.min(...beats.slice(1).map((t, i) => t - beats[i]))
-    : Infinity;
-  const showLabels = ready && minBeatGap * zoomPxPerSec > 40;
 
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
@@ -597,16 +2282,29 @@ export default function WaveformEditor({
             {loadProgress < 80
               ? `Decoding audio… ${loadProgress}%`
               : loadProgress < 100 ? "Computing peaks…" : "Rendering…"}
+            {loadPhase && <span className="load-phase-badge"> · {loadPhase}</span>}
           </span>
         </div>
       )}
 
       <div
+        ref={beatsStripOuterRef}
+        className="beats-strip-outer"
+        style={{ visibility: ready ? "visible" : "hidden" }}
+      >
+        <div ref={beatsStripInnerRef} className="beats-strip-inner" />
+      </div>
+
+      <div
+        ref={bassContainerRef}
+        className="bass-canvas"
+        style={{ visibility: ready ? "visible" : "hidden" }}
+      />
+
+      <div
         ref={containerRef}
         className={[
           "waveform-canvas",
-          showLabels ? "show-beat-labels" : "",
-          stretchMode ? "stretch-mode-active" : "",
         ].filter(Boolean).join(" ")}
         style={{ visibility: ready ? "visible" : "hidden" }}
       />
@@ -615,7 +2313,6 @@ export default function WaveformEditor({
         <div className={[
           "transport-bar",
           recording ? "transport-bar-recording" : "",
-          stretchMode ? "transport-bar-stretch" : "",
         ].filter(Boolean).join(" ")}>
 
           {/* Playback */}
@@ -631,10 +2328,52 @@ export default function WaveformEditor({
           >
             {playing ? "⏸" : "▶"}
           </button>
+          <button
+            className={`transport-btn transport-play-both${(playing && midiPlaying) ? " transport-play-both-active" : ""}`}
+            onClick={togglePlayBoth}
+            title={(playing || midiPlaying) ? "Pause MP3 + MIDI" : "Play MP3 + MIDI together"}
+          >
+            {(playing || midiPlaying) ? "⏸" : "▶"}
+            <span className="play-both-badge">+♪</span>
+          </button>
           <span className="transport-time">
             {formatTime(currentTime)}
             <span className="transport-duration"> / {formatTime(duration)}</span>
           </span>
+
+          {loadPhase && (
+            <span className="load-phase-transport">{loadPhase}</span>
+          )}
+
+          {/* Play beats */}
+          <label className="play-beats-label">
+            <input
+              type="checkbox"
+              checked={playBeats}
+              onChange={e => {
+                const v = e.target.checked;
+                setPlayBeats(v);
+                localStorage.setItem("beats_play_beats", String(v));
+              }}
+            />
+            Play beats
+          </label>
+
+          {/* Spectrogram toggle */}
+          <label className="play-beats-label">
+            <input
+              type="checkbox"
+              checked={showSpec}
+              onChange={e => {
+                const v = e.target.checked;
+                setShowSpec(v);
+                showSpecRef.current = v;
+                localStorage.setItem("beats_show_spec", String(v));
+                drawSpectrogram();
+              }}
+            />
+            Spectrogram
+          </label>
 
           {/* Rate */}
           <div className="rate-selector">
@@ -665,61 +2404,69 @@ export default function WaveformEditor({
           </button>
           {recording && <span className="rec-indicator">REC · tap B</span>}
 
-          {/* Stretch mode */}
-          <button
-            className={`transport-btn stretch-btn${stretchMode ? " stretch-btn-active" : ""}`}
-            onClick={() => {
-              const next = !stretchMode;
-              setStretchMode(next);
-              stretchModeRef.current = next;
-              if (!next) { setStretchAnchor(null); stretchAnchorRef.current = null; }
-            }}
-            title={stretchMode ? "Exit stretch mode (T or Esc)" : "Stretch mode (T): click anchor, Shift+click end"}
-          >
-            ⇔ Stretch
-          </button>
-          {stretchMode && (
-            <span className="stretch-indicator">
-              {stretchAnchor !== null
-                ? `${formatTime(stretchAnchor)} → Shift+click end (or S)`
-                : "Click to set anchor"}
-            </span>
-          )}
+          {/* Stretch */}
+          {(() => {
+            const activeStretch = stretches.find(s => currentTime >= s.start && currentTime <= s.end) ?? null;
+            const selectionOverlapsStretch = selection !== null &&
+              stretches.some(s => selection.end > s.start && selection.start < s.end);
+            const canStretch = !selectionOverlapsStretch && (!!selection || !!activeStretch);
+            const isActive = !!selection || !!activeStretch;
+            const title = selectionOverlapsStretch
+              ? "Selection overlaps an existing stretch — clear selection or pick a different range"
+              : selection
+                ? "Stretch selected region (S)"
+                : activeStretch
+                  ? "Edit or remove this stretch region (S)"
+                  : "Shift+click to select a region, then stretch (S)";
+            return (
+              <>
+                <button
+                  className={`transport-btn stretch-btn${isActive && !selectionOverlapsStretch ? " stretch-btn-active" : ""}`}
+                  onClick={() => {
+                    if (!canStretch) return;
+                    if (selection) {
+                      setStretchModal({ start: selection.start, end: selection.end });
+                    } else if (activeStretch) {
+                      setStretchModal({ start: activeStretch.start, end: activeStretch.end, existingFactor: activeStretch.factor });
+                    }
+                  }}
+                  disabled={!canStretch}
+                  title={title}
+                >
+                  ⇔ Stretch
+                </button>
+                {selection && (
+                  <span className={`stretch-indicator${selectionOverlapsStretch ? " stretch-indicator-warning" : ""}`}>
+                    {formatTime(selection.start)} → {formatTime(selection.end)}
+                    {selectionOverlapsStretch && " ⚠"}
+                  </span>
+                )}
+              </>
+            );
+          })()}
 
           <div className="transport-spacer" />
 
           {beats.length > 0 && <span className="beat-count">{beats.length} beats</span>}
           {stretches.length > 0 && (
-            <>
-              <span className="beat-count">{stretches.length} stretch{stretches.length !== 1 ? "es" : ""}</span>
-              <button
-                className="transport-btn rerender-btn"
-                onClick={rerenderWaveform}
-                disabled={rerendering}
-                title={bakedWavPath
-                  ? "Re-bake: reprocess original MP3 with current stretches (Cmd+R)"
-                  : "Bake: save high-quality stretched WAV (Cmd+R)"}
-              >
-                {rerendering ? "Rendering…" : bakedWavPath ? "⌘R Re-bake" : "⌘R Bake"}
-              </button>
-            </>
+            <span className="beat-count">{stretches.length} stretch{stretches.length !== 1 ? "es" : ""}</span>
           )}
 
           {/* Export */}
           <button
             className="transport-btn export-btn"
             onClick={handleExport}
-            disabled={exporting}
+            disabled={exportProgress !== null}
             title="Export to MP3 with all stretches applied (requires ffmpeg)"
           >
-            {exporting ? "Exporting…" : "↓ Export MP3"}
+            ↓ Export MP3
           </button>
           {exportError && (
             <span className="export-error" title={exportError}>⚠ export failed</span>
           )}
 
           {/* Zoom */}
-          <span className="zoom-hint">Ctrl+scroll</span>
+          <span className="zoom-hint">scroll to zoom</span>
           <button className="transport-btn" onClick={handleZoomOut} title="Zoom out">−</button>
           <span className="zoom-label">{zoomLabel}</span>
           <button className="transport-btn" onClick={handleZoomIn} title="Zoom in">+</button>
@@ -731,6 +2478,124 @@ export default function WaveformEditor({
         </div>
       )}
 
+      {/* ── Piano Roll ───────────────────────────────────────────────────── */}
+      <div className="piano-roll-section">
+        <div className="piano-roll-header">
+          <span className="piano-roll-title">Piano Roll · Rach 2</span>
+
+          {/* Movement selector */}
+          {/* MIDI transport */}
+          <button className="piano-roll-play-btn" onClick={() => {
+            selectedTimelineRef.current = 'midi';
+            setSelectedTimeline('midi');
+            midiTogglePlay();
+          }} title={midiPlaying ? 'Pause MIDI' : 'Play MIDI'}>
+            {midiPlaying ? '⏸' : '▶'}
+          </button>
+          <span className="piano-roll-cursor-time">{formatTime(midiCursorDisp)}</span>
+          {samplerStatus === 'loading' && (
+            <span className="sampler-status sampler-loading">
+              Loading Steinway… {samplerProgress}%
+            </span>
+          )}
+          {samplerStatus === 'ready' && (
+            <span className="sampler-status sampler-ready" title="Salamander Grand Piano (Steinway D)">
+              🎹 Steinway
+            </span>
+          )}
+          {samplerStatus === 'error' && (
+            <span className="sampler-status sampler-error" title="Could not load samples — using synthesis">
+              ⚠ samples unavailable
+            </span>
+          )}
+
+          {/* Beat annotation */}
+          <button
+            className="piano-roll-tap-btn"
+            onClick={midiTapBeat}
+            title="Mark current MIDI cursor position as a beat (T)"
+          >
+            ✦ Tap Beat <span className="piano-roll-tap-hint">T</span>
+          </button>
+          <span className={`piano-roll-beat-count${midiBeats.length > beats.length ? ' warn' : ''}`}>
+            {midiBeats.length}/{beats.length} beats
+          </span>
+          {midiBeats.length > 0 && (
+            <button
+              className="piano-roll-clear-btn"
+              onClick={() => { onMidiBeatsChangeRef.current([]); midiBeatsRef.current = []; drawPianoRoll(); }}
+              title="Clear MIDI beats"
+            >✕</button>
+          )}
+
+          {/* Render options */}
+          <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+            {ROLL_OPTION_LABELS.map(({ key, label, title }) => (
+              <button
+                key={key}
+                title={title}
+                onClick={() => setRollOptions(o => ({ ...o, [key]: !o[key] }))}
+                style={{
+                  padding: '1px 6px', fontSize: 10, borderRadius: 3, cursor: 'pointer',
+                  border: `1px solid ${rollOptions[key] ? 'var(--accent)' : 'var(--border)'}`,
+                  background: rollOptions[key] ? 'var(--accent)' : 'transparent',
+                  color: rollOptions[key] ? '#fff' : 'var(--text-muted)',
+                  fontFamily: 'inherit',
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Legend */}
+          <div className="piano-roll-legend">
+            {midiLegend.map((t, i) => {
+              const isSolo  = soloTrackIndex === i;
+              const dimmed  = soloTrackIndex !== null && !isSolo;
+              const st      = midiTrackStatsRef.current[i];
+              return (
+                <span
+                  key={i}
+                  className="piano-roll-legend-item"
+                  onClick={() => setSoloTrackIndex(isSolo ? null : i)}
+                  style={{ cursor: 'pointer', opacity: dimmed ? 0.3 : 1, outline: isSolo ? `1px solid ${t.color}` : 'none', borderRadius: 3, padding: '1px 3px', flexDirection: 'column', alignItems: 'flex-start', gap: 2 }}
+                >
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span className="piano-roll-legend-dot" style={{ background: t.color }} />
+                    {t.name}
+                  </span>
+                  {st && (rollOptions.ioiRegularity || rollOptions.gridLock) && (
+                    <span style={{ display: 'flex', gap: 3, paddingLeft: 12 }}>
+                      {rollOptions.ioiRegularity && (
+                        <span title={`IOI regularity: ${Math.round(st.ioiRegularity * 100)}%`}
+                          style={{ display: 'flex', alignItems: 'center', gap: 2, fontSize: 9, color: 'var(--text-muted)' }}>
+                          <span style={{ width: 28, height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden', display: 'inline-block' }}>
+                            <span style={{ display: 'block', width: `${st.ioiRegularity * 100}%`, height: '100%', background: '#ffb347', borderRadius: 2 }} />
+                          </span>
+                        </span>
+                      )}
+                      {rollOptions.gridLock && (
+                        <span title={`Grid alignment: ${Math.round((gridLockCacheRef.current?.scores[i] ?? 0) * 100)}%`}
+                          style={{ display: 'flex', alignItems: 'center', gap: 2, fontSize: 9, color: 'var(--text-muted)' }}>
+                          <span style={{ width: 28, height: 3, background: 'var(--border)', borderRadius: 2, overflow: 'hidden', display: 'inline-block' }}>
+                            <span style={{ display: 'block', width: `${(gridLockCacheRef.current?.scores[i] ?? 0) * 100}%`, height: '100%', background: '#4ea6dc', borderRadius: 2 }} />
+                          </span>
+                        </span>
+                      )}
+                    </span>
+                  )}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        <div className="piano-roll-body" style={{ height: PIANO_ROLL_H }}>
+          <div className="piano-key-wrap" style={{ width: KEYBOARD_W, flexShrink: 0 }} />
+          <div className="piano-roll-notes" style={{ flex: 1 }} />
+        </div>
+      </div>
+
       {stretchModal && (
         <StretchModal
           start={stretchModal.start}
@@ -738,7 +2603,28 @@ export default function WaveformEditor({
           beats={beats}
           onConfirm={handleStretchConfirm}
           onCancel={() => setStretchModal(null)}
+          initialFactor={stretchModal.existingFactor}
+          onRemove={stretchModal.existingFactor != null ? handleStretchRemove : undefined}
         />
+      )}
+
+      {exportProgress !== null && (
+        <div className="modal-backdrop">
+          <div className="modal export-progress-modal">
+            <div className="modal-header">
+              <span className="modal-title">Exporting MP3</span>
+            </div>
+            <div className="modal-body">
+              <div className="export-progress-bar-wrap">
+                <div
+                  className="export-progress-bar-fill"
+                  style={{ width: `${exportProgress}%` }}
+                />
+              </div>
+              <span className="export-progress-pct">{exportProgress}%</span>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -238,10 +238,215 @@ html, body, #root {
   color: var(--text-muted);
 }
 
+.load-phase-badge {
+  opacity: 0.7;
+  font-style: italic;
+}
+
+.load-phase-transport {
+  font-size: 11px;
+  color: #f0a030;
+  font-style: italic;
+  animation: phase-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes phase-pulse {
+  0%, 100% { opacity: 0.6; }
+  50%       { opacity: 1.0; }
+}
+
+.beats-strip-outer {
+  height: 24px;
+  flex-shrink: 0;
+  overflow: hidden;
+  position: relative;
+  border-bottom: 1px solid var(--border);
+}
+
+.beats-strip-inner {
+  position: relative;
+  height: 100%;
+  min-width: 100%;
+}
+
 .waveform-canvas {
   flex: 1;
   padding: 16px 0 0;
   min-height: 0;
+}
+
+.bass-canvas {
+  height: 52px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  opacity: 0.85;
+}
+
+/* ── Piano Roll ──────────────────────────────── */
+
+.piano-roll-section {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: #080810;
+  display: flex;
+  flex-direction: column;
+}
+
+.piano-roll-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.piano-roll-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.piano-roll-mov-btns {
+  display: flex;
+  gap: 4px;
+}
+
+.piano-roll-mov-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.piano-roll-mov-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.piano-roll-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-left: 4px;
+}
+
+.piano-roll-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.piano-roll-legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.piano-roll-play-btn {
+  padding: 2px 8px;
+  font-size: 13px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.piano-roll-play-btn:hover { background: var(--border); }
+
+.piano-roll-cursor-time {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  min-width: 56px;
+}
+
+.sampler-status {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.sampler-loading {
+  color: #facc15;
+  background: rgba(250, 204, 21, 0.1);
+  border: 1px solid rgba(250, 204, 21, 0.3);
+}
+.sampler-ready {
+  color: #86efac;
+  background: rgba(134, 239, 172, 0.1);
+  border: 1px solid rgba(134, 239, 172, 0.25);
+}
+.sampler-error {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+}
+
+.piano-roll-tap-btn {
+  padding: 2px 10px;
+  font-size: 11px;
+  border-radius: 3px;
+  border: 1px solid #4ea6dc88;
+  background: #4ea6dc18;
+  color: #4ea6dc;
+  cursor: pointer;
+}
+
+.piano-roll-tap-btn:hover { background: #4ea6dc30; }
+.piano-roll-tap-btn:active { background: #4ea6dc55; transform: scale(0.96); }
+
+.piano-roll-tap-hint {
+  opacity: 0.55;
+  font-size: 9px;
+  margin-left: 2px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.piano-roll-beat-count {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.piano-roll-beat-count.warn { color: #e05c5c; }
+
+.piano-roll-clear-btn {
+  padding: 1px 6px;
+  font-size: 10px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.piano-roll-clear-btn:hover { color: #e05c5c; border-color: #e05c5c88; }
+
+.piano-roll-body {
+  display: flex;
+  overflow: hidden;
+}
+
+.piano-key-wrap {
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.piano-roll-notes {
+  overflow: hidden;
+  min-width: 0;
 }
 
 /* ── Transport Bar ───────────────────────────── */
@@ -293,6 +498,36 @@ html, body, #root {
   color: #fff;
 }
 
+.transport-play-both {
+  width: 48px;
+  height: 40px;
+  font-size: 14px;
+  background: transparent;
+  border: 1.5px solid #2dd4bf;
+  color: #2dd4bf;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 6px;
+}
+
+.transport-play-both:hover {
+  background: rgba(45, 212, 191, 0.15);
+  border-color: #5eead4;
+  color: #5eead4;
+}
+
+.transport-play-both-active {
+  background: rgba(45, 212, 191, 0.2);
+}
+
+.play-both-badge {
+  font-size: 9px;
+  opacity: 0.85;
+  line-height: 1;
+}
+
 .transport-time {
   font-size: 13px;
   font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
@@ -306,6 +541,24 @@ html, body, #root {
 
 .transport-spacer {
   flex: 1;
+}
+
+/* ── Play Beats Checkbox ─────────────────────── */
+
+.play-beats-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.play-beats-label input {
+  accent-color: var(--accent);
+  cursor: pointer;
 }
 
 /* ── Rate Selector ───────────────────────────── */
@@ -405,33 +658,11 @@ html, body, #root {
 }
 
 /* ── Beat Markers ────────────────────────────── */
-
-/* WaveSurfer renders region divs; we style them to look like vertical lines */
-.waveform-canvas [part="region"] {
-  min-width: 2px !important;
-  border-left: 2px solid rgba(251, 191, 36, 0.9);
-  background: rgba(251, 191, 36, 0.15) !important;
-  overflow: visible !important;
-}
+/* Note: beat region elements live inside WaveSurfer's shadow DOM,
+   so they must be styled via inline styles in JS, not CSS classes. */
 
 /* ── BPM Labels ──────────────────────────────── */
-
-.beat-label {
-  display: none;
-  position: absolute;
-  bottom: calc(100% + 3px);
-  left: 0;
-  font-size: 9px;
-  font-family: "SF Mono", "Fira Code", monospace;
-  color: rgba(251, 191, 36, 0.9);
-  white-space: nowrap;
-  pointer-events: none;
-  line-height: 1;
-}
-
-.show-beat-labels .beat-label {
-  display: block;
-}
+/* Styled inline in JS (shadow DOM). */
 
 /* ── Stretch Mode ────────────────────────────── */
 
@@ -463,6 +694,10 @@ html, body, #root {
   letter-spacing: 0.3px;
 }
 
+.stretch-indicator-warning {
+  color: #fb923c;
+}
+
 .stretch-mode-active {
   cursor: crosshair;
 }
@@ -480,15 +715,6 @@ html, body, #root {
   white-space: nowrap;
 }
 
-/* Baked overlay — subtler than live, slate-tinted border */
-.waveform-canvas [part="region"][id^="stretch-"].baked-region {
-  border-left-color: rgba(148, 163, 184, 0.5);
-}
-
-.stretch-label-baked {
-  color: rgba(148, 163, 184, 0.8);
-  font-weight: 500;
-}
 
 /* ── Modal ───────────────────────────────────── */
 
@@ -661,6 +887,18 @@ html, body, #root {
   color: var(--text-primary);
 }
 
+.modal-btn-remove {
+  background: transparent;
+  border: 1px solid #7f1d1d;
+  color: #f87171;
+  margin-right: auto;
+}
+
+.modal-btn-remove:hover {
+  background: #2a1010;
+  border-color: #f87171;
+}
+
 .modal-btn-confirm {
   background: var(--accent);
   border: 1px solid transparent;
@@ -676,28 +914,34 @@ html, body, #root {
   cursor: default;
 }
 
-/* ── Re-render ───────────────────────────────── */
+/* ── Export Progress Modal ───────────────────── */
 
-.rerender-btn {
-  color: #a78bfa;
-  border-color: #3b2a6b;
+.export-progress-modal {
+  width: 320px;
 }
 
-.rerender-btn:hover:not(:disabled) {
-  background: #1e1040;
-  border-color: #a78bfa;
-  color: #c4b5fd;
+.export-progress-bar-wrap {
+  width: 100%;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
 }
 
-.rerender-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
-  animation: rerender-pulse 1.2s ease-in-out infinite;
+.export-progress-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.15s ease;
 }
 
-@keyframes rerender-pulse {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
+.export-progress-pct {
+  display: block;
+  text-align: right;
+  font-size: 12px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: var(--text-muted);
+  margin-top: 6px;
 }
 
 /* ── Export ──────────────────────────────────── */

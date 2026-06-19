@@ -60,7 +60,7 @@ pub fn apply_stretches(samples: &[f32], channels: usize, sample_rate: u32, stret
     result
 }
 
-fn write_wav(samples: &[f32], channels: usize, sample_rate: u32, path: &str) -> Result<(), String> {
+pub(crate) fn write_wav(samples: &[f32], channels: usize, sample_rate: u32, path: &str) -> Result<(), String> {
     let spec = hound::WavSpec {
         channels: channels as u16,
         sample_rate,

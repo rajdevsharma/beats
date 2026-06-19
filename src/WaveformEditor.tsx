@@ -7,6 +7,9 @@ import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
+import ExportVideoModal, { VideoExportOpts } from "./ExportVideoModal";
+import SpectrogramControls from "./SpectrogramControls";
+import { originalToStretched, stretchedDuration } from "./timeMapping";
 
 // ── Salamander Grand Piano sampler ─────────────────────────────────────────
 // Free Steinway D recording by Alexander Holm, hosted by Tone.js.
@@ -130,10 +133,12 @@ interface LoadResult {
   duration: number;
   sample_rate: number;
   channels: number;
-  spectrogram: string;       // base64 flat u8 [col * bins + bin]
   spec_cols: number;
-  spec_bins: number;
   spec_cols_per_sec: number;
+  spec_midi_lo: number;
+  spec_midi_hi: number;
+  spec_raw: { data: string; bins: number };       // fine magnitude, base64 flat u8
+  spec_salience: { data: string; bins: number };  // harmonic-sum pitch salience
 }
 
 // Inferno colormap (sampled from matplotlib) — perceptually designed for spectrograms.
@@ -238,6 +243,55 @@ function computeTrackColors(tracks: MidiTrack[]): string[] {
 }
 const BLACK_PCS = new Set([1, 3, 6, 8, 10]);
 
+// ── Spectrogram live controls ──────────────────────────────────────────────
+export interface SpecCtrl {
+  mode: 'raw' | 'melody'; // raw magnitude vs harmonic-salience (melody) layer
+  gain: number;           // dB added to every cell (brightness)
+  floor: number;          // dB black-point (noise gate)
+  gamma: number;          // contrast curve
+  lo: number;             // MIDI low edge of the visible pitch window
+  hi: number;             // MIDI high edge
+}
+const DEFAULT_SPEC_CTRL: SpecCtrl = { mode: 'raw', gain: 0, floor: -68, gamma: 0.7, lo: 21, hi: 108 };
+function loadSpecCtrl(): SpecCtrl {
+  try {
+    const raw = localStorage.getItem("beats_spec_ctrl");
+    if (raw) return { ...DEFAULT_SPEC_CTRL, ...JSON.parse(raw) };
+  } catch { /* ignore */ }
+  return DEFAULT_SPEC_CTRL;
+}
+const NOTE_NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+export function midiNoteName(m: number): string {
+  const n = Math.round(m);
+  return `${NOTE_NAMES[((n % 12) + 12) % 12]}${Math.floor(n / 12) - 1}`;
+}
+
+// Parse the track colors we generate ('#rrggbb' or 'hsl(h,s%,l%)') to RGB
+// for the Rust video renderer.
+function cssColorToRgb(c: string): [number, number, number] {
+  if (c.startsWith('#')) {
+    const v = parseInt(c.slice(1), 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+  }
+  const m = c.match(/hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*\)/);
+  if (!m) return [255, 255, 255];
+  const h = parseFloat(m[1]) / 360, s = parseFloat(m[2]) / 100, l = parseFloat(m[3]) / 100;
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const channel = (t: number) => {
+    t = ((t % 1) + 1) % 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return [
+    Math.round(channel(h + 1 / 3) * 255),
+    Math.round(channel(h) * 255),
+    Math.round(channel(h - 1 / 3) * 255),
+  ];
+}
+
 const ZOOM_STEP = 1.5 ** 0.2; // ~1.084 — 5× less sensitive than original 1.5
 const ZOOM_MAX_MULTIPLIER = 500;
 const ZOOM_DEBOUNCE_MS = 80;
@@ -296,6 +350,9 @@ export default function WaveformEditor({
   const [stretchModal, setStretchModal] = useState<{ start: number; end: number; existingFactor?: number } | null>(null);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [videoModalOpen, setVideoModalOpen] = useState(false);
+  const [videoProgress, setVideoProgress] = useState<{ pct: number; stage: string } | null>(null);
+  const [videoError, setVideoError] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rateProcessing, setRateProcessing] = useState(false);
   // PCM decode happens in background after waveform is shown
@@ -310,16 +367,33 @@ export default function WaveformEditor({
 
   // ── Spectrogram ────────────────────────────────────────────────────────────
   const specCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const specDataRef = useRef<Uint8Array | null>(null);
+  const specRawRef = useRef<Uint8Array | null>(null);   // fine magnitude layer
+  const specRawBinsRef = useRef(0);
+  const specSalRef = useRef<Uint8Array | null>(null);   // harmonic-salience layer
+  const specSalBinsRef = useRef(0);
   const specColsRef = useRef(0);
-  const specBinsRef = useRef(0);
   const specColsPerSecRef = useRef(0);
+  const specMidiLoRef = useRef(21);
+  const specMidiHiRef = useRef(108);
   const scrollLeftRef = useRef(0);
   const [showSpec, setShowSpec] = useState(() =>
     localStorage.getItem("beats_show_spec") !== "false"
   );
   const showSpecRef = useRef(showSpec);
   useEffect(() => { showSpecRef.current = showSpec; }, [showSpec]);
+  const [specCtrlOpen, setSpecCtrlOpen] = useState(() =>
+    localStorage.getItem("beats_spec_ctrl_open") === "true"
+  );
+
+  // Live spectrogram dials (the "ultrasound" controls), persisted.
+  const [specCtrl, setSpecCtrl] = useState<SpecCtrl>(loadSpecCtrl);
+  const specCtrlRef = useRef<SpecCtrl>(specCtrl);
+  useEffect(() => {
+    specCtrlRef.current = specCtrl;
+    localStorage.setItem("beats_spec_ctrl", JSON.stringify(specCtrl));
+    drawSpectrogram();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [specCtrl]);
 
   // ── Piano Roll state ───────────────────────────────────────────────────────
   const [midiLegend, setMidiLegend] = useState<{ name: string; color: string }[]>([]);
@@ -858,8 +932,10 @@ export default function WaveformEditor({
       }
       return;
     }
-    const specData = specDataRef.current;
-    if (!specData) return;
+    const ctrl = specCtrlRef.current;
+    const specData = ctrl.mode === 'melody' ? specSalRef.current : specRawRef.current;
+    const bins = ctrl.mode === 'melody' ? specSalBinsRef.current : specRawBinsRef.current;
+    if (!specData || bins === 0) return;
 
     const width = canvas.width;
     const height = canvas.height;
@@ -871,9 +947,35 @@ export default function WaveformEditor({
     const scrollLeft = scrollLeftRef.current;
     const pxPerSec = zoomPxPerSecRef.current;
     const cols = specColsRef.current;
-    const bins = specBinsRef.current;
     const colsPerSec = specColsPerSecRef.current;
-    if (cols === 0 || bins === 0 || pxPerSec === 0) return;
+    if (cols === 0 || pxPerSec === 0) return;
+
+    const midiLo = specMidiLoRef.current;
+    const midiHi = specMidiHiRef.current;
+    const midiSpan = midiHi - midiLo;          // bin b ↔ midi = midiLo + b/(bins-1)*midiSpan
+    const viewLo = Math.max(midiLo, ctrl.lo);
+    const viewHi = Math.min(midiHi, ctrl.hi);
+    if (viewHi <= viewLo) return;
+
+    // dB reconstruction: stored u8 0..255 ↔ −90..0 dB (DB_FLOOR..DB_CEIL).
+    const DB_FLOOR = -90, DB_CEIL = 0, DB_RANGE = DB_CEIL - DB_FLOOR;
+    const floor = ctrl.floor, span = Math.max(1, DB_CEIL - floor);
+    const gain = ctrl.gain, invGamma = ctrl.gamma;
+
+    // Precompute, per output row, the fractional bin and interpolation tap —
+    // identical for every column, so this loop runs once not width×height.
+    const b0 = new Int32Array(height);
+    const b1 = new Int32Array(height);
+    const bf = new Float32Array(height);
+    for (let y = 0; y < height; y++) {
+      const midi = viewHi - (y / height) * (viewHi - viewLo);
+      const fb = midiSpan > 0 ? ((midi - midiLo) / midiSpan) * (bins - 1) : 0;
+      const lo = Math.floor(fb);
+      const hi = Math.min(bins - 1, lo + 1);
+      b0[y] = Math.max(0, Math.min(bins - 1, lo));
+      b1[y] = Math.max(0, hi);
+      bf[y] = fb - lo;
+    }
 
     const imageData = ctx.createImageData(width, height);
     const data = imageData.data;
@@ -885,15 +987,20 @@ export default function WaveformEditor({
       const colBase = col * bins;
 
       for (let y = 0; y < height; y++) {
-        // y=0 = top = high freq; y=height-1 = bottom = low freq
-        const b = Math.floor((height - 1 - y) * bins / height);
-        const v = specData[colBase + b];
-        const pi3 = v * 3;
+        // Vertically interpolate between adjacent pitch bins for smooth zoom.
+        const u8 = specData[colBase + b0[y]] * (1 - bf[y]) + specData[colBase + b1[y]] * bf[y];
+        let db = DB_FLOOR + (u8 / 255) * DB_RANGE + gain;
+        let tnorm = (db - floor) / span;
+        if (tnorm <= 0) continue; // below the floor → fully transparent
+        if (tnorm > 1) tnorm = 1;
+        const v = Math.pow(tnorm, invGamma);
+        const ci = (v * 255) | 0;
+        const pi3 = ci * 3;
         const idx = (y * width + x) * 4;
         data[idx]     = INFERNO[pi3];
         data[idx + 1] = INFERNO[pi3 + 1];
         data[idx + 2] = INFERNO[pi3 + 2];
-        data[idx + 3] = Math.round(40 + v * 215); // transparent when silent, opaque when loud
+        data[idx + 3] = Math.round(30 + v * 225);
       }
     }
 
@@ -1583,7 +1690,8 @@ export default function WaveformEditor({
     setPlaying(false);
     playingRef.current = false;
     setPcmReady(false);
-    specDataRef.current = null;
+    specRawRef.current = null;
+    specSalRef.current = null;
     scrollLeftRef.current = 0;
 
     (async () => {
@@ -1605,41 +1713,22 @@ export default function WaveformEditor({
           invoke("set_stretches_audio", { stretches: stretchesRef.current }).catch(console.error);
         }
 
-        // Decode spectrogram base64 into a Uint8Array
-        const raw = atob(result.spectrogram);
-        const specBytes = new Uint8Array(raw.length);
-        for (let i = 0; i < raw.length; i++) specBytes[i] = raw.charCodeAt(i);
-
-        // Per-frequency-bin contrast stretching: normalize each bin to its own
-        // observed min/max so quiet high-frequency content isn't lost in black.
-        // Skip bins with little activity (range ≤ 20) to avoid amplifying silence.
-        {
-          const cols = result.spec_cols;
-          const bins = result.spec_bins;
-          const binMin = new Uint8Array(bins).fill(255);
-          const binMax = new Uint8Array(bins);
-          for (let c = 0; c < cols; c++) {
-            const base = c * bins;
-            for (let b = 0; b < bins; b++) {
-              const v = specBytes[base + b];
-              if (v < binMin[b]) binMin[b] = v;
-              if (v > binMax[b]) binMax[b] = v;
-            }
-          }
-          for (let c = 0; c < cols; c++) {
-            const base = c * bins;
-            for (let b = 0; b < bins; b++) {
-              const range = binMax[b] - binMin[b];
-              if (range > 20)
-                specBytes[base + b] = Math.round((specBytes[base + b] - binMin[b]) / range * 255);
-            }
-          }
-        }
-
-        specDataRef.current = specBytes;
+        // Decode both spectrogram layers (base64 → Uint8Array). Bytes are
+        // linear-dB u8 (−90..0 dB); the live dials reconstruct dB and remap.
+        const decodeB64 = (s: string) => {
+          const raw = atob(s);
+          const out = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+          return out;
+        };
+        specRawRef.current = decodeB64(result.spec_raw.data);
+        specRawBinsRef.current = result.spec_raw.bins;
+        specSalRef.current = decodeB64(result.spec_salience.data);
+        specSalBinsRef.current = result.spec_salience.bins;
         specColsRef.current = result.spec_cols;
-        specBinsRef.current = result.spec_bins;
         specColsPerSecRef.current = result.spec_cols_per_sec;
+        specMidiLoRef.current = result.spec_midi_lo;
+        specMidiHiRef.current = result.spec_midi_hi;
 
         const channelData = result.peaks.map(ch => new Float32Array(ch));
         await ws.load("", channelData, result.duration);
@@ -1666,7 +1755,14 @@ export default function WaveformEditor({
       if (pct >= 100) setTimeout(() => setExportProgress(null), 600);
     });
     const u4 = listen<string>("load-phase", (ev) => setLoadPhase(ev.payload));
-    return () => { u1.then(fn => fn()); u2.then(fn => fn()); u3.then(fn => fn()); u4.then(fn => fn()); };
+    const u5 = listen<{ pct: number; stage: string }>("video-export-progress", (ev) => {
+      setVideoProgress(ev.payload);
+      if (ev.payload.pct >= 100) setTimeout(() => setVideoProgress(null), 600);
+    });
+    return () => {
+      u1.then(fn => fn()); u2.then(fn => fn()); u3.then(fn => fn());
+      u4.then(fn => fn()); u5.then(fn => fn());
+    };
   }, []);
 
   // ── Beat tick sound ───────────────────────────────────────────────────────
@@ -1999,6 +2095,66 @@ export default function WaveformEditor({
     } catch (e) {
       setExportError(String(e));
       setExportProgress(null);
+    }
+  }
+
+  // ── Export to Video ───────────────────────────────────────────────────────
+  // Notes are mapped MIDI time → original audio time (beat-pair warp) →
+  // stretched/output time, so the video lines up with the exported audio.
+  async function handleVideoExport(opts: VideoExportOpts) {
+    setVideoModalOpen(false);
+    if (videoProgress !== null) return;
+    setVideoError(null);
+
+    const outPath = await saveDialog({
+      title: "Export Video",
+      filters: [{ name: "MP4 Video", extensions: ["mp4"] }],
+      defaultPath: mp3Path.replace(/\.mp3$/i, "") + "_pianoroll.mp4",
+    });
+    if (!outPath) return;
+
+    const tracks = midiTracksRef.current;
+    const colors = midiTrackColorsRef.current;
+    const sts = stretchesRef.current;
+    const hasWarp = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
+
+    const vTracks = tracks.map((t, i) => ({
+      color: cssColorToRgb(t.isPiano ? '#ffffff' : (colors[i] ?? '#ffffff')),
+      is_piano: t.isPiano,
+    }));
+    const vNotes: { start: number; dur: number; pitch: number; vel: number; track: number }[] = [];
+    tracks.forEach((t, ti) => {
+      for (const n of t.notes) {
+        const o0 = hasWarp ? warpMidiTime(n.time) : n.time;
+        const o1 = hasWarp ? warpMidiTime(n.time + n.dur) : n.time + n.dur;
+        const s0 = originalToStretched(o0, sts);
+        const s1 = originalToStretched(o1, sts);
+        vNotes.push({ start: s0, dur: Math.max(0.05, s1 - s0), pitch: n.pitch, vel: n.vel, track: ti });
+      }
+    });
+    const vBeats = beatsRef.current.map(b => originalToStretched(b, sts));
+
+    setVideoProgress({ pct: 0, stage: "Starting" });
+    try {
+      await invoke("export_video", {
+        mp3Path,
+        stretches: sts,
+        outputPath: outPath,
+        tracks: vTracks,
+        notes: vNotes,
+        beats: vBeats,
+        options: {
+          orientation: opts.orientation,
+          start: opts.start,
+          end: opts.end,
+          fps: 30,
+          width: 1920,
+          height: 1080,
+        },
+      });
+    } catch (e) {
+      setVideoError(String(e));
+      setVideoProgress(null);
     }
   }
 
@@ -2374,6 +2530,22 @@ export default function WaveformEditor({
             />
             Spectrogram
           </label>
+          {showSpec && (
+            <button
+              className={`spec-expand-btn${specCtrlOpen ? " spec-expand-btn-active" : ""}`}
+              onClick={() => {
+                const v = !specCtrlOpen;
+                setSpecCtrlOpen(v);
+                localStorage.setItem("beats_spec_ctrl_open", String(v));
+              }}
+              title={specCtrlOpen ? "Collapse spectrogram controls" : "Spectrogram controls"}
+            >
+              ⚙ {specCtrlOpen ? "▾" : "▸"}
+            </button>
+          )}
+          {showSpec && specCtrlOpen && (
+            <SpectrogramControls value={specCtrl} onChange={setSpecCtrl} />
+          )}
 
           {/* Rate */}
           <div className="rate-selector">
@@ -2463,6 +2635,17 @@ export default function WaveformEditor({
           </button>
           {exportError && (
             <span className="export-error" title={exportError}>⚠ export failed</span>
+          )}
+          <button
+            className="transport-btn export-btn"
+            onClick={() => setVideoModalOpen(true)}
+            disabled={videoProgress !== null || midiLegend.length === 0}
+            title="Export a Synthesia-style piano-roll video with the stretched audio (requires ffmpeg)"
+          >
+            ▶ Export Video
+          </button>
+          {videoError && (
+            <span className="export-error" title={videoError}>⚠ video export failed</span>
           )}
 
           {/* Zoom */}
@@ -2622,6 +2805,35 @@ export default function WaveformEditor({
                 />
               </div>
               <span className="export-progress-pct">{exportProgress}%</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {videoModalOpen && (
+        <ExportVideoModal
+          totalDuration={stretchedDuration(duration, stretches)}
+          onConfirm={handleVideoExport}
+          onCancel={() => setVideoModalOpen(false)}
+        />
+      )}
+
+      {videoProgress !== null && (
+        <div className="modal-backdrop">
+          <div className="modal export-progress-modal">
+            <div className="modal-header">
+              <span className="modal-title">Exporting Video</span>
+            </div>
+            <div className="modal-body">
+              <div className="export-progress-bar-wrap">
+                <div
+                  className="export-progress-bar-fill"
+                  style={{ width: `${videoProgress.pct}%` }}
+                />
+              </div>
+              <span className="export-progress-pct">
+                {videoProgress.stage} · {videoProgress.pct}%
+              </span>
             </div>
           </div>
         </div>

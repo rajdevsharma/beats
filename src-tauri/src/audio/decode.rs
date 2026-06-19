@@ -15,12 +15,21 @@ pub struct DecodedAudio {
     pub duration_secs: f64,
 }
 
-pub struct SpectrogramData {
-    pub data_b64: String,  // base64 of flat u8 [col * bins + bin]
-    pub cols: usize,
+/// One spectrogram layer on the shared semitone-log time/pitch grid.
+/// Bytes are linear-dB-mapped u8 (DB_FLOOR..DB_CEIL), NOT gamma-corrected —
+/// the frontend reconstructs dB and applies gain/floor/contrast live.
+pub struct SpecLayer {
+    pub bytes: Vec<u8>, // flat [col * bins + bin], bin 0 = MIDI_LO
     pub bins: usize,
+}
+
+pub struct SpectrogramData {
+    pub cols: usize,
     pub cols_per_sec: f32,
-    raw: Vec<u8>,          // original bytes, kept for peaks-cache writing
+    pub midi_lo: u8,
+    pub midi_hi: u8,
+    pub raw: SpecLayer,      // fine magnitude, RAW_BPST bins/semitone
+    pub salience: SpecLayer, // harmonic-sum pitch salience, 1 bin/semitone
 }
 
 pub struct AudioMeta {
@@ -34,7 +43,7 @@ pub struct AudioMeta {
 
 // ── Base64 encoder (no dep) ───────────────────────────────────────────────
 
-fn to_base64(data: &[u8]) -> String {
+pub fn to_base64(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
@@ -54,21 +63,50 @@ fn to_base64(data: &[u8]) -> String {
 // Emits one spectrogram column every `hop` mono frames.
 // Uses a circular ring buffer to avoid allocating a fresh window each hop.
 
-const STFT_SIZE: usize = 2048;
-const STFT_BINS: usize = 64;
+// A larger window than a plain rhythm-spectrogram would use: trades some time
+// resolution for the frequency resolution needed to separate adjacent pitches
+// in the low/mid register where melodic lines live.
+const STFT_SIZE: usize = 4096;
+
+// Pitch grid shared by both layers (A0 .. C8 — the 88-key piano range).
+const MIDI_LO: u8 = 21;
+const MIDI_HI: u8 = 108;
+const RAW_BPST: usize = 2;   // raw layer: bins per semitone
+const HARMONICS: usize = 12; // harmonics summed for the salience layer
+
+// Non-destructive dB encoding window. 90 dB / 255 ≈ 0.35 dB per step.
+const DB_FLOOR: f32 = -90.0;
+const DB_CEIL: f32 = 0.0;
+
+#[inline]
+fn midi_to_freq(midi: f32) -> f32 {
+    440.0 * 2.0_f32.powf((midi - 69.0) / 12.0)
+}
+
+#[inline]
+fn db_to_u8(mag_norm: f32) -> u8 {
+    let db = 20.0 * mag_norm.max(1e-10).log10();
+    (((db - DB_FLOOR) / (DB_CEIL - DB_FLOOR)).clamp(0.0, 1.0) * 255.0) as u8
+}
 
 struct StftAccumulator {
     hop: usize,
     cols_per_sec: f32,
     hann: Vec<f32>,
-    log_bin_idxs: Vec<usize>,
     ring: Vec<f32>,           // circular, length = STFT_SIZE
     ring_write: usize,        // index of next write slot (= oldest slot to read)
     frames_since_hop: usize,
     fft_plan: std::sync::Arc<dyn rustfft::Fft<f32>>,
     fft_input: Vec<Complex<f32>>,
     fft_scratch: Vec<Complex<f32>>,
-    cols: Vec<u8>,            // flat: [col * STFT_BINS + bin]
+    mag: Vec<f32>,            // |X[k]| for k in 0..STFT_SIZE/2, reused per col
+    // Precomputed sampling plans (fractional FFT-bin lookups):
+    raw_bins: usize,
+    raw_taps: Vec<(usize, f32)>,         // per raw bin: (base idx, frac)
+    sal_bins: usize,
+    sal_taps: Vec<Vec<(usize, f32, f32)>>, // per pitch: harmonic (idx, frac, weight)
+    raw_cols: Vec<u8>,
+    sal_cols: Vec<u8>,
     col_count: usize,
 }
 
@@ -76,19 +114,43 @@ impl StftAccumulator {
     fn new(sample_rate: u32) -> Self {
         let hop = (sample_rate / 20).max(1) as usize; // 20 cols/sec
         let cols_per_sec = sample_rate as f32 / hop as f32;
+        let half = STFT_SIZE / 2;
+        let bin_hz = sample_rate as f32 / STFT_SIZE as f32;
+        let nyquist = sample_rate as f32 / 2.0;
 
         let hann: Vec<f32> = (0..STFT_SIZE)
             .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32
                 / (STFT_SIZE - 1) as f32).cos()))
             .collect();
 
-        // Log-spaced frequency bins from 40 Hz to 8000 Hz
-        let log_bin_idxs: Vec<usize> = (0..STFT_BINS)
-            .map(|b| {
-                let f = 40.0_f32 * (8000.0_f32 / 40.0_f32)
-                    .powf(b as f32 / (STFT_BINS - 1) as f32);
-                let idx = (f * STFT_SIZE as f32 / sample_rate as f32).round() as usize;
-                idx.min(STFT_SIZE / 2 - 1)
+        // Linear-interpolated FFT-bin lookup for an arbitrary frequency.
+        let tap = |freq: f32| -> (usize, f32) {
+            let pos = (freq / bin_hz).clamp(0.0, (half - 2) as f32);
+            (pos.floor() as usize, pos.fract())
+        };
+
+        // Raw layer: RAW_BPST bins per semitone across the pitch range.
+        let semis = (MIDI_HI - MIDI_LO) as usize;
+        let raw_bins = semis * RAW_BPST + 1;
+        let raw_taps: Vec<(usize, f32)> = (0..raw_bins)
+            .map(|b| tap(midi_to_freq(MIDI_LO as f32 + b as f32 / RAW_BPST as f32)))
+            .collect();
+
+        // Salience layer: one bin per semitone; each is a weighted harmonic sum.
+        let sal_bins = semis + 1;
+        let weight = |h: usize| 1.0 / (h as f32).powf(0.8);
+        let sal_taps: Vec<Vec<(usize, f32, f32)>> = (0..sal_bins)
+            .map(|p| {
+                let f0 = midi_to_freq((MIDI_LO + p as u8) as f32);
+                (1..=HARMONICS)
+                    .map(|h| f0 * h as f32)
+                    .take_while(|&fh| fh < nyquist)
+                    .enumerate()
+                    .map(|(i, fh)| {
+                        let (idx, frac) = tap(fh);
+                        (idx, frac, weight(i + 1))
+                    })
+                    .collect()
             })
             .collect();
 
@@ -100,14 +162,19 @@ impl StftAccumulator {
             hop,
             cols_per_sec,
             hann,
-            log_bin_idxs,
             ring: vec![0.0; STFT_SIZE],
             ring_write: 0,
             frames_since_hop: 0,
             fft_plan,
             fft_input: vec![Complex::default(); STFT_SIZE],
             fft_scratch: vec![Complex::default(); scratch_len],
-            cols: Vec::new(),
+            mag: vec![0.0; half],
+            raw_bins,
+            raw_taps,
+            sal_bins,
+            sal_taps,
+            raw_cols: Vec::new(),
+            sal_cols: Vec::new(),
             col_count: 0,
         }
     }
@@ -123,6 +190,12 @@ impl StftAccumulator {
         }
     }
 
+    #[inline]
+    fn sample(&self, idx: usize, frac: f32) -> f32 {
+        // Linear interp between adjacent magnitude bins.
+        self.mag[idx] + (self.mag[idx + 1] - self.mag[idx]) * frac
+    }
+
     fn emit_col(&mut self) {
         // Build windowed FFT input from ring buffer (oldest sample first)
         let start = self.ring_write; // oldest position
@@ -132,28 +205,42 @@ impl StftAccumulator {
         }
         self.fft_plan.process_with_scratch(&mut self.fft_input, &mut self.fft_scratch);
 
-        // Normalize: peak magnitude ≈ STFT_SIZE/2 for full-scale signal
-        let norm = (STFT_SIZE as f32) / 2.0;
-        for &bi in &self.log_bin_idxs {
-            let mag = self.fft_input[bi].norm();
-            let db = 20.0 * (mag / norm).max(1e-10_f32).log10();
-            // Per-bin energy in orchestral music typically sits at -60 to -20 dB.
-            // Map that range to [0, 1] then apply gamma 0.35 to spread mid-level
-            // content across the full color palette instead of clustering at the low end.
-            let v = ((db + 60.0) / 60.0).clamp(0.0, 1.0).powf(0.35);
-            self.cols.push((v * 255.0) as u8);
+        let half = STFT_SIZE / 2;
+        for k in 0..half {
+            self.mag[k] = self.fft_input[k].norm();
         }
+        let norm = (STFT_SIZE as f32) / 2.0; // ≈ peak magnitude for full-scale
+
+        // Raw magnitude layer.
+        for &(idx, frac) in &self.raw_taps {
+            self.raw_cols.push(db_to_u8(self.sample(idx, frac) / norm));
+        }
+
+        // Harmonic salience layer: each pitch is the weighted average magnitude
+        // of its harmonic series, so an instrument's whole overtone stack
+        // collapses onto a single bright line at its fundamental.
+        for taps in &self.sal_taps {
+            let mut sum = 0.0;
+            let mut wsum = 0.0;
+            for &(idx, frac, w) in taps {
+                sum += w * self.sample(idx, frac);
+                wsum += w;
+            }
+            let avg = if wsum > 0.0 { sum / wsum } else { 0.0 };
+            self.sal_cols.push(db_to_u8(avg / norm));
+        }
+
         self.col_count += 1;
     }
 
     fn finish(self) -> SpectrogramData {
-        let data_b64 = to_base64(&self.cols);
         SpectrogramData {
-            data_b64,
             cols: self.col_count,
-            bins: STFT_BINS,
             cols_per_sec: self.cols_per_sec,
-            raw: self.cols,
+            midi_lo: MIDI_LO,
+            midi_hi: MIDI_HI,
+            raw: SpecLayer { bytes: self.raw_cols, bins: self.raw_bins },
+            salience: SpecLayer { bytes: self.sal_cols, bins: self.sal_bins },
         }
     }
 }
@@ -548,13 +635,17 @@ pub fn decode_audio_file(path: &str) -> Result<DecodedAudio, String> {
 //   4 bytes  n_peaks  per channel (u32 LE)
 //   4 bytes  n_bass   per channel (u32 LE)
 //   4 bytes  spec_cols (u32 LE)
-//   4 bytes  spec_bins (u32 LE)
 //   4 bytes  cols_per_sec (f32 LE)
+//   1 byte   midi_lo
+//   1 byte   midi_hi
+//   4 bytes  raw_bins (u32 LE)
+//   4 bytes  sal_bins (u32 LE)
 //   channels × n_peaks × 4 bytes  peaks     (f32 LE)
 //   channels × n_bass  × 4 bytes  bass_peaks (f32 LE)
-//   spec_cols × spec_bins bytes    spectrogram (u8)
+//   spec_cols × raw_bins bytes     raw layer (u8)
+//   spec_cols × sal_bins bytes     salience layer (u8)
 
-const PEAKS_MAGIC: &[u8; 8] = b"PEAKS002";
+const PEAKS_MAGIC: &[u8; 8] = b"PEAKS003";
 
 fn peaks_cache_path(audio_path: &str) -> String {
     format!("{}.peaks", audio_path)
@@ -580,9 +671,12 @@ fn write_peaks_cache(path: &str, meta: &AudioMeta) {
         let n_bass  = meta.bass_peaks.first().map(|v| v.len()).unwrap_or(0) as u32;
         w.write_all(&n_peaks.to_le_bytes())?;
         w.write_all(&n_bass.to_le_bytes())?;
-        w.write_all(&(meta.spectrogram.cols as u32).to_le_bytes())?;
-        w.write_all(&(meta.spectrogram.bins as u32).to_le_bytes())?;
-        w.write_all(&meta.spectrogram.cols_per_sec.to_le_bytes())?;
+        let spec = &meta.spectrogram;
+        w.write_all(&(spec.cols as u32).to_le_bytes())?;
+        w.write_all(&spec.cols_per_sec.to_le_bytes())?;
+        w.write_all(&[spec.midi_lo, spec.midi_hi])?;
+        w.write_all(&(spec.raw.bins as u32).to_le_bytes())?;
+        w.write_all(&(spec.salience.bins as u32).to_le_bytes())?;
         for ch in &meta.peaks {
             let bytes = unsafe {
                 std::slice::from_raw_parts(ch.as_ptr() as *const u8, ch.len() * 4)
@@ -595,7 +689,8 @@ fn write_peaks_cache(path: &str, meta: &AudioMeta) {
             };
             w.write_all(bytes)?;
         }
-        w.write_all(&meta.spectrogram.raw)?;
+        w.write_all(&spec.raw.bytes)?;
+        w.write_all(&spec.salience.bytes)?;
         w.flush()
     })();
     if result.is_ok() {
@@ -625,8 +720,11 @@ fn try_load_peaks_cache(path: &str) -> Option<AudioMeta> {
     r.read_exact(&mut b4).ok()?; let n_peaks      = u32::from_le_bytes(b4) as usize;
     r.read_exact(&mut b4).ok()?; let n_bass       = u32::from_le_bytes(b4) as usize;
     r.read_exact(&mut b4).ok()?; let spec_cols    = u32::from_le_bytes(b4) as usize;
-    r.read_exact(&mut b4).ok()?; let spec_bins    = u32::from_le_bytes(b4) as usize;
     r.read_exact(&mut b4).ok()?; let cols_per_sec = f32::from_le_bytes(b4);
+    let mut b2 = [0u8; 2];
+    r.read_exact(&mut b2).ok()?; let midi_lo = b2[0]; let midi_hi = b2[1];
+    r.read_exact(&mut b4).ok()?; let raw_bins = u32::from_le_bytes(b4) as usize;
+    r.read_exact(&mut b4).ok()?; let sal_bins = u32::from_le_bytes(b4) as usize;
 
     if channels == 0 || sample_rate == 0 { return None; }
 
@@ -646,10 +744,10 @@ fn try_load_peaks_cache(path: &str) -> Option<AudioMeta> {
         r.read_exact(bytes).ok()?;
     }
 
-    let spec_len = spec_cols * spec_bins;
-    let mut raw = vec![0u8; spec_len];
-    r.read_exact(&mut raw).ok()?;
-    let data_b64 = to_base64(&raw);
+    let mut raw_bytes = vec![0u8; spec_cols * raw_bins];
+    r.read_exact(&mut raw_bytes).ok()?;
+    let mut sal_bytes = vec![0u8; spec_cols * sal_bins];
+    r.read_exact(&mut sal_bytes).ok()?;
 
     Some(AudioMeta {
         channels,
@@ -657,7 +755,14 @@ fn try_load_peaks_cache(path: &str) -> Option<AudioMeta> {
         duration_secs,
         peaks,
         bass_peaks,
-        spectrogram: SpectrogramData { data_b64, cols: spec_cols, bins: spec_bins, cols_per_sec, raw },
+        spectrogram: SpectrogramData {
+            cols: spec_cols,
+            cols_per_sec,
+            midi_lo,
+            midi_hi,
+            raw: SpecLayer { bytes: raw_bytes, bins: raw_bins },
+            salience: SpecLayer { bytes: sal_bytes, bins: sal_bins },
+        },
     })
 }
 
@@ -809,4 +914,58 @@ pub fn estimated_pcm_bytes(path: &str) -> Option<usize> {
     let n_frames = track.codec_params.n_frames? as usize;
     let channels = track.codec_params.channels?.count();
     Some(n_frames * channels * 4)
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::*;
+
+    // Build a harmonic tone (fundamental + decaying overtones) and confirm the
+    // salience layer concentrates it onto the fundamental's pitch bin while the
+    // raw layer spreads energy across every harmonic.
+    #[test]
+    fn salience_collapses_harmonics_to_fundamental() {
+        let sr = 44100u32;
+        let f0 = 220.0f32; // A3 = MIDI 57
+        let mut acc = StftAccumulator::new(sr);
+        let n = sr as usize * 2; // 2 seconds
+        for i in 0..n {
+            let t = i as f32 / sr as f32;
+            let mut s = 0.0;
+            for h in 1..=6 {
+                s += (1.0 / h as f32) * (2.0 * std::f32::consts::PI * f0 * h as f32 * t).sin();
+            }
+            acc.push(s * 0.2);
+        }
+        let spec = acc.finish();
+        assert!(spec.cols > 10, "expected multiple columns");
+
+        // Inspect a column from the steady middle of the tone.
+        let col = spec.cols / 2;
+        let sal = &spec.salience;
+        let sb = &sal.bytes[col * sal.bins..(col + 1) * sal.bins];
+        let (sal_peak_bin, _) = sb.iter().enumerate().max_by_key(|(_, &v)| v).unwrap();
+        let expected = (57 - MIDI_LO) as usize; // A3
+        assert!(
+            (sal_peak_bin as i32 - expected as i32).abs() <= 1,
+            "salience peak at bin {sal_peak_bin}, expected ~{expected} (A3)"
+        );
+
+        // The salience peak should dominate the octave-above bin. Harmonic-sum
+        // salience has inherent octave ambiguity (A4 catches A3's even
+        // harmonics), so we require a clear margin, not total suppression.
+        let octave_up = expected + 12;
+        assert!(
+            sb[sal_peak_bin] as i32 - sb[octave_up] as i32 > 12,
+            "fundamental ({}) should dominate octave-up ({})",
+            sb[sal_peak_bin], sb[octave_up]
+        );
+
+        // Raw layer: count distinct bright peaks — a harmonic stack lights several.
+        let raw = &spec.raw;
+        let rb = &raw.bytes[col * raw.bins..(col + 1) * raw.bins];
+        let max_raw = *rb.iter().max().unwrap();
+        let bright = rb.iter().filter(|&&v| v as u16 + 30 > max_raw as u16).count();
+        assert!(bright >= 3, "raw layer should show several harmonic peaks, got {bright}");
+    }
 }

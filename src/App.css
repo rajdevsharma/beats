@@ -847,6 +847,97 @@ html, body, #root {
   margin-top: -4px;
 }
 
+/* ── Spectrogram live controls ──────────────────────────────────────────── */
+.spec-expand-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.spec-expand-btn:hover { color: var(--text-primary); border-color: var(--accent); }
+.spec-expand-btn-active { color: var(--accent); border-color: var(--accent); }
+
+.spec-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 3px 8px;
+  background: rgba(123, 104, 238, 0.07);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.spec-seg, .spec-presets {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.spec-presets { gap: 0; }
+.spec-seg-btn, .spec-preset-btn {
+  padding: 3px 9px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--card);
+  border: none;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.spec-seg-btn + .spec-seg-btn,
+.spec-preset-btn + .spec-preset-btn { border-left: 1px solid var(--border); }
+.spec-seg-btn-active, .spec-preset-btn-active {
+  background: var(--accent);
+  color: #fff;
+}
+.spec-slider, .spec-range {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.spec-slider input[type="range"] { width: 64px; accent-color: var(--accent); }
+.spec-range input[type="range"] { width: 52px; accent-color: var(--accent); }
+.spec-slider-label { white-space: nowrap; }
+.spec-slider-val {
+  min-width: 30px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  color: var(--text-primary);
+}
+
+.video-seg {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.video-seg-btn {
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--text-muted);
+  background: var(--card);
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.video-seg-btn + .video-seg-btn {
+  border-left: 1px solid var(--border);
+}
+
+.video-seg-btn-active {
+  background: var(--accent);
+  color: #fff;
+}
+
 .modal-preview {
   background: var(--card);
   border: 1px solid var(--border);

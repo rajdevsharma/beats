@@ -1,4 +1,5 @@
 mod audio;
+mod video;
 
 use audio::AudioEngine;
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,7 @@ pub fn run() {
             load_project,
             audio::export_mp3,
             audio::get_audio_duration,
+            video::export_video,
             audio::engine::load_audio,
             audio::engine::set_stretches_audio,
             audio::engine::set_playback_rate,

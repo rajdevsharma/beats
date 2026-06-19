@@ -17,7 +17,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use super::{apply_stretches, StretchSeg};
-use super::decode::{scan_peaks_cached, decode_audio_file_with_progress, decode_audio_file_full, estimated_pcm_bytes, pcm_cache_is_fresh};
+use super::decode::{scan_peaks_cached, decode_audio_file_with_progress, decode_audio_file_full, estimated_pcm_bytes, pcm_cache_is_fresh, to_base64, SpectrogramData};
 use super::rubberband::{Stretcher, OPT_REALTIME};
 
 // Fixed-point scale: position AtomicU64 = warped_frame × FP_SCALE
@@ -309,16 +309,37 @@ struct PositionEvent { t: f64, playing: bool }
 // ── Tauri command return types ─────────────────────────────────────────────
 
 #[derive(Serialize)]
+pub struct SpecLayerOut {
+    pub data: String, // base64 of flat u8 [col * bins + bin]
+    pub bins: usize,
+}
+
+#[derive(Serialize)]
 pub struct LoadResult {
     pub peaks: Vec<Vec<f32>>,
     pub bass_peaks: Vec<Vec<f32>>,
     pub duration: f64,
     pub sample_rate: u32,
     pub channels: usize,
-    pub spectrogram: String,
     pub spec_cols: usize,
-    pub spec_bins: usize,
     pub spec_cols_per_sec: f32,
+    pub spec_midi_lo: u8,
+    pub spec_midi_hi: u8,
+    pub spec_raw: SpecLayerOut,
+    pub spec_salience: SpecLayerOut,
+}
+
+impl LoadResult {
+    fn spec_fields(spec: &SpectrogramData) -> (usize, f32, u8, u8, SpecLayerOut, SpecLayerOut) {
+        (
+            spec.cols,
+            spec.cols_per_sec,
+            spec.midi_lo,
+            spec.midi_hi,
+            SpecLayerOut { data: to_base64(&spec.raw.bytes), bins: spec.raw.bins },
+            SpecLayerOut { data: to_base64(&spec.salience.bytes), bins: spec.salience.bins },
+        )
+    }
 }
 
 #[derive(Serialize)]
@@ -377,15 +398,14 @@ pub async fn load_audio(
         let _ = app.emit("pcm-ready", ());
         let _ = app.emit("load-progress", 100u8);
 
+        let (spec_cols, spec_cols_per_sec, spec_midi_lo, spec_midi_hi, spec_raw, spec_salience) =
+            LoadResult::spec_fields(&spec);
         LoadResult {
             peaks, bass_peaks,
             duration: decoded.duration_secs,
             sample_rate: decoded.sample_rate,
             channels: decoded.channels,
-            spectrogram: spec.data_b64,
-            spec_cols: spec.cols,
-            spec_bins: spec.bins,
-            spec_cols_per_sec: spec.cols_per_sec,
+            spec_cols, spec_cols_per_sec, spec_midi_lo, spec_midi_hi, spec_raw, spec_salience,
         }
     } else {
         let path2 = path.clone();
@@ -450,16 +470,15 @@ pub async fn load_audio(
             Ok::<(), String>(())
         });
 
+        let (spec_cols, spec_cols_per_sec, spec_midi_lo, spec_midi_hi, spec_raw, spec_salience) =
+            LoadResult::spec_fields(&meta.spectrogram);
         LoadResult {
             peaks: meta.peaks,
             bass_peaks: meta.bass_peaks,
             duration: meta.duration_secs,
             sample_rate: meta.sample_rate,
             channels: meta.channels,
-            spectrogram: meta.spectrogram.data_b64,
-            spec_cols: meta.spectrogram.cols,
-            spec_bins: meta.spectrogram.bins,
-            spec_cols_per_sec: meta.spectrogram.cols_per_sec,
+            spec_cols, spec_cols_per_sec, spec_midi_lo, spec_midi_hi, spec_raw, spec_salience,
         }
     };
 

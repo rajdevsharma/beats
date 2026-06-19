@@ -31,10 +31,18 @@ cpal = "0.15"
 rustfft = "6"
 tauri-plugin-log = "2.8.0"
 log = "0.4.30"
+tiny-skia = "0.11"
+rayon = "1"
 
 # Optimize all dependencies even in debug builds.
 # Our own code stays unoptimized for fast incremental recompiles.
 # This makes symphonia MP3 decode ~10-20x faster in `tauri dev`.
 [profile.dev.package."*"]
 opt-level = 3
+
+# tiny-skia has debug_assert!(false) fallbacks for hairline strokes that
+# extend off-canvas (harmless skips in release). Keep them off in dev too.
+[profile.dev.package.tiny-skia]
+opt-level = 3
+debug-assertions = false
 

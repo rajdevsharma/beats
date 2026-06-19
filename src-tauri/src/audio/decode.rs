@@ -279,6 +279,47 @@ impl BiquadLP {
     }
 }
 
+/// Bass-onset peaks from interleaved PCM — a 200 Hz low-pass followed by
+/// per-chunk energy flux (rising low-frequency energy). Mirrors the inline
+/// computation in `scan_peaks`/`decode_audio_file_full` so a re-derived
+/// (e.g. stretched) buffer produces a matching bass lane.
+pub(crate) fn compute_bass_peaks(samples: &[f32], channels: usize, sample_rate: u32) -> Vec<Vec<f32>> {
+    let chunk = (sample_rate / 100).max(1) as usize;
+    let chunk_f = chunk as f64;
+    let total_frames = samples.len() / channels;
+    let mut out: Vec<Vec<f32>> = vec![Vec::with_capacity(total_frames / chunk + 1); channels];
+    let mut filters: Vec<BiquadLP> = (0..channels).map(|_| BiquadLP::new(200.0, sample_rate)).collect();
+    let mut sum_sq = vec![0.0f64; channels];
+    let mut prev_energy = vec![0.0f64; channels];
+    let mut frames_in_chunk = 0usize;
+
+    for f in 0..total_frames {
+        for c in 0..channels {
+            let bv = filters[c].process(samples[f * channels + c]) as f64;
+            sum_sq[c] += bv * bv;
+        }
+        frames_in_chunk += 1;
+        if frames_in_chunk >= chunk {
+            for c in 0..channels {
+                let energy = sum_sq[c] / chunk_f;
+                let flux = (energy - prev_energy[c]).max(0.0);
+                out[c].push(flux.sqrt() as f32);
+                prev_energy[c] = energy;
+                sum_sq[c] = 0.0;
+            }
+            frames_in_chunk = 0;
+        }
+    }
+    if frames_in_chunk > 0 {
+        for c in 0..channels {
+            let energy = sum_sq[c] / frames_in_chunk as f64;
+            let flux = (energy - prev_energy[c]).max(0.0);
+            out[c].push(flux.sqrt() as f32);
+        }
+    }
+    out
+}
+
 fn open_format(path: &str) -> Result<
     (Box<dyn symphonia::core::formats::FormatReader>, u32, usize, u32, f64),
     String,
@@ -967,5 +1008,36 @@ mod spec_tests {
         let max_raw = *rb.iter().max().unwrap();
         let bright = rb.iter().filter(|&&v| v as u16 + 30 > max_raw as u16).count();
         assert!(bright >= 3, "raw layer should show several harmonic peaks, got {bright}");
+    }
+
+    // compute_bass_peaks should pass low frequencies (and react to their onset)
+    // while rejecting high frequencies — so a re-derived stretched buffer yields
+    // a bass lane matching the decode-time one.
+    #[test]
+    fn bass_peaks_pass_low_reject_high() {
+        let sr = 44100u32;
+        let n = sr as usize * 2;
+        let tone = |freq: f32| -> Vec<f32> {
+            (0..n).map(|i| {
+                // first second silent, second second a tone → clear onset
+                if i < n / 2 { 0.0 }
+                else { (2.0 * std::f32::consts::PI * freq * i as f32 / sr as f32).sin() * 0.5 }
+            }).collect()
+        };
+
+        let low = compute_bass_peaks(&tone(80.0), 1, sr);
+        let high = compute_bass_peaks(&tone(5000.0), 1, sr);
+        let low_max = low[0].iter().cloned().fold(0.0f32, f32::max);
+        let high_max = high[0].iter().cloned().fold(0.0f32, f32::max);
+
+        // 80 Hz passes the 200 Hz low-pass; 5 kHz is strongly attenuated.
+        assert!(low_max > high_max * 5.0,
+            "low ({low_max}) should dominate high ({high_max})");
+
+        // The onset (chunk near the midpoint) should be the brightest part.
+        let mid_chunk = low[0].len() / 2;
+        let onset = low[0][mid_chunk.saturating_sub(2)..(mid_chunk + 3).min(low[0].len())]
+            .iter().cloned().fold(0.0f32, f32::max);
+        assert!(onset > low_max * 0.5, "onset flux should be prominent");
     }
 }

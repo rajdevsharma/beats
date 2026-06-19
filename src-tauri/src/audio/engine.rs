@@ -345,6 +345,7 @@ impl LoadResult {
 #[derive(Serialize)]
 pub struct SetStretchesResult {
     pub peaks: Vec<Vec<f32>>,
+    pub bass_peaks: Vec<Vec<f32>>,
     pub warped_duration: f64,
     pub cursor_orig: f64, // playback position in original-audio seconds after remap
 }
@@ -508,6 +509,7 @@ pub async fn set_stretches_audio(
         let new_warped_frames = new_warped.len() / channels;
         let new_warped_duration = new_warped_frames as f64 / sample_rate as f64;
         let peaks = compute_peaks(&new_warped, channels, sample_rate);
+        let bass_peaks = super::decode::compute_bass_peaks(&new_warped, channels, sample_rate);
         let new_warped = Arc::new(new_warped);
 
         // Remap position: old warped frame → original secs → new warped frame
@@ -549,7 +551,7 @@ pub async fn set_stretches_audio(
             }
         }
 
-        Ok(SetStretchesResult { peaks, warped_duration: new_warped_duration, cursor_orig: orig_t })
+        Ok(SetStretchesResult { peaks, bass_peaks, warped_duration: new_warped_duration, cursor_orig: orig_t })
     })
     .await
     .map_err(|e| e.to_string())?

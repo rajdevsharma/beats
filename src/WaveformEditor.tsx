@@ -1866,7 +1866,7 @@ export default function WaveformEditor({
     }
     (async () => {
       try {
-        const res = await invoke<{ peaks: number[][]; warped_duration: number; cursor_orig: number }>(
+        const res = await invoke<{ peaks: number[][]; bass_peaks: number[][]; warped_duration: number; cursor_orig: number }>(
           "set_stretches_audio", { stretches }
         );
         if (cancelled) return;
@@ -1876,6 +1876,10 @@ export default function WaveformEditor({
         if (ws && res.peaks?.length) {
           const channelData = res.peaks.map(ch => new Float32Array(ch));
           await ws.load("", channelData, res.warped_duration);
+        }
+        if (bassWsRef.current && res.bass_peaks?.length) {
+          const bassData = res.bass_peaks.map(ch => new Float32Array(ch));
+          await bassWsRef.current.load("", bassData, res.warped_duration).catch(() => {});
         }
         // Reposition cursor to the same musical point on the new timeline.
         const dispT = o2s(res.cursor_orig);

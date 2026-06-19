@@ -374,6 +374,24 @@ html, body, #root {
   min-width: 56px;
 }
 
+.midi-vol {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.midi-vol input[type="range"] {
+  width: 70px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.midi-vol-icon { font-size: 11px; }
+.midi-vol-val {
+  font-variant-numeric: tabular-nums;
+  min-width: 30px;
+}
+
 .sampler-status {
   font-size: 10px;
   padding: 1px 7px;

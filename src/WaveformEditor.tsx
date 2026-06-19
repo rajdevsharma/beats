@@ -434,6 +434,12 @@ export default function WaveformEditor({
 
   // ── MIDI playback engine ───────────────────────────────────────────────────
   const midiAudioCtxRef    = useRef<AudioContext & { masterOut?: AudioNode } | null>(null);
+  const midiGainRef        = useRef<GainNode | null>(null); // master volume for MIDI
+  const [midiVolume, setMidiVolume] = useState(() => {
+    const v = parseFloat(localStorage.getItem("beats_midi_volume") ?? "1");
+    return isFinite(v) ? v : 1;
+  });
+  const midiVolumeRef      = useRef(midiVolume);
   const midiPlayingRef     = useRef(false);
   const midiStartWallRef   = useRef(0);   // audioCtx.currentTime when play was pressed
   const midiStartPosRef    = useRef(0);   // MIDI cursor position (MIDI time) at play start
@@ -457,6 +463,13 @@ export default function WaveformEditor({
   useEffect(() => { selectedMidiBeatRef.current = selectedMidiBeat; }, [selectedMidiBeat]);
 
   useEffect(() => { playBeatsRef.current = playBeats; }, [playBeats]);
+  useEffect(() => {
+    midiVolumeRef.current = midiVolume;
+    localStorage.setItem("beats_midi_volume", String(midiVolume));
+    const g = midiGainRef.current;
+    const ctx = midiAudioCtxRef.current;
+    if (g && ctx) g.gain.setTargetAtTime(midiVolume, ctx.currentTime, 0.02);
+  }, [midiVolume]);
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; drawPianoRoll(); }, [beats]);
@@ -1309,7 +1322,12 @@ export default function WaveformEditor({
       const comp = ctx.createDynamicsCompressor();
       comp.threshold.value = -18;
       comp.ratio.value = 4;
-      comp.connect(ctx.destination);
+      // Master volume: notes → compressor → gain → destination.
+      const gain = ctx.createGain();
+      gain.gain.value = midiVolumeRef.current;
+      comp.connect(gain);
+      gain.connect(ctx.destination);
+      midiGainRef.current = gain;
       ctx.masterOut = comp;
       midiAudioCtxRef.current = ctx;
     }
@@ -2764,6 +2782,17 @@ export default function WaveformEditor({
             {midiPlaying ? '⏸' : '▶'}
           </button>
           <span className="piano-roll-cursor-time">{formatTime(midiCursorDisp)}</span>
+
+          {/* MIDI volume */}
+          <label className="midi-vol" title={`MIDI volume: ${Math.round(midiVolume * 100)}%`}>
+            <span className="midi-vol-icon">{midiVolume === 0 ? '🔇' : '🔊'}</span>
+            <input
+              type="range" min={0} max={1.5} step={0.01} value={midiVolume}
+              onChange={e => setMidiVolume(parseFloat(e.target.value))}
+            />
+            <span className="midi-vol-val">{Math.round(midiVolume * 100)}%</span>
+          </label>
+
           {samplerStatus === 'loading' && (
             <span className="sampler-status sampler-loading">
               Loading Steinway… {samplerProgress}%

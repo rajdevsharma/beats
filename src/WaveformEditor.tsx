@@ -9,7 +9,10 @@ import { Stretch } from "./types";
 import StretchModal from "./StretchModal";
 import ExportVideoModal, { VideoExportOpts } from "./ExportVideoModal";
 import SpectrogramControls from "./SpectrogramControls";
-import { originalToStretched, stretchedDuration } from "./timeMapping";
+import {
+  originalToStretched, stretchedToOriginal, stretchedDuration,
+  buildSegments, TimeSegment,
+} from "./timeMapping";
 
 // ── Salamander Grand Piano sampler ─────────────────────────────────────────
 // Free Steinway D recording by Alexander Holm, hosted by Tone.js.
@@ -330,10 +333,30 @@ export default function WaveformEditor({
   const cmdHeldRef = useRef(false);
   const selectionRef = useRef<{ start: number; end: number } | null>(null);
   const regionJustClickedRef = useRef(false);
-  const durationRef = useRef(0);
-  const currentTimeRef = useRef(0);
+  const durationRef = useRef(0);          // STRETCHED (display/output) duration
+  const origDurationRef = useRef(0);      // ORIGINAL recording duration
+  const segmentsRef = useRef<TimeSegment[]>([]); // original↔stretched piecewise map
+  const currentTimeRef = useRef(0);       // STRETCHED time
   const playingRef = useRef(false);
   const selectedTimelineRef = useRef<'mp3' | 'midi'>('mp3');
+
+  // The editor's visible timeline is STRETCHED (output) time so that stretches
+  // visibly rescale the waveform. Beats and stretches are STORED in original
+  // time; these convert at the render / engine boundaries. With no stretches
+  // both are the identity, so behavior is unchanged until a stretch exists.
+  function o2s(t: number) { return originalToStretched(t, stretchesRef.current); }
+  function s2o(t: number) { return stretchedToOriginal(t, segmentsRef.current); }
+  // MIDI time ↔ display (stretched) time: warp via beat pairs, then apply stretch.
+  // The piano roll is drawn on the same x-axis as the waveform, and MIDI
+  // playback rides this axis so it follows stretches and stays in sync.
+  function midiToDisp(mt: number) {
+    const hasWarp = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
+    return o2s(hasWarp ? warpMidiTime(mt) : mt);
+  }
+  function dispToMidi(st: number) {
+    const hasWarp = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
+    return hasWarp ? audioTimeToMidiTime(s2o(st)) : s2o(st);
+  }
 
   // ── State ──────────────────────────────────────────────────────────────────
   const [loadProgress, setLoadProgress] = useState(0);
@@ -437,7 +460,10 @@ export default function WaveformEditor({
 
   // Keep refs in sync
   useEffect(() => { beatsRef.current = beats; drawPianoRoll(); }, [beats]);
-  useEffect(() => { stretchesRef.current = stretches; }, [stretches]);
+  useEffect(() => {
+    stretchesRef.current = stretches;
+    segmentsRef.current = buildSegments(origDurationRef.current, stretches);
+  }, [stretches]);
   useEffect(() => { onBeatsChangeRef.current = onBeatsChange; }, [onBeatsChange]);
   useEffect(() => { onStretchesChangeRef.current = onStretchesChange; }, [onStretchesChange]);
   useEffect(() => { onMidiBeatsChangeRef.current = onMidiBeatsChange; }, [onMidiBeatsChange]);
@@ -543,8 +569,8 @@ export default function WaveformEditor({
       setSelectedTimeline('mp3');
 
       if (cmdHeldRef.current) {
-        // Cmd+click: add a beat
-        const updated = [...beatsRef.current, t].sort((a, b) => a - b);
+        // Cmd+click: add a beat (t is display time; beats store original time)
+        const updated = [...beatsRef.current, s2o(t)].sort((a, b) => a - b);
         onBeatsChangeRef.current(updated);
         return;
       }
@@ -566,13 +592,14 @@ export default function WaveformEditor({
       selectionRef.current = null;
       setSelection(null);
 
-      // Sync MIDI cursor if t is within the jointly-annotated range
+      // Sync MIDI cursor if t is within the jointly-annotated range (original time)
       {
+        const to = s2o(t);
         const mb = midiBeatsRef.current;
         const ab = beatsRef.current;
         const n = Math.min(mb.length, ab.length);
-        if (n >= 2 && t >= ab[0] && t <= ab[n - 1]) {
-          midiSeekTo(audioTimeToMidiTime(t));
+        if (n >= 2 && to >= ab[0] && to <= ab[n - 1]) {
+          midiSeekTo(audioTimeToMidiTime(to));
         }
       }
     });
@@ -726,8 +753,7 @@ export default function WaveformEditor({
 
         const startClientX  = e.clientX;
         const pxPerSec      = zoomPxPerSecRef.current;
-        const hasWarp       = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
-        const startAudioT   = (hasWarp ? warpMidiTime(hit) : hit);
+        const startAudioT   = midiToDisp(hit); // display (stretched) time
         const startX        = startAudioT * pxPerSec - scrollLeftRef.current - KEYBOARD_W;
         let dragging        = false;
         let liveMidiT       = hit;
@@ -812,7 +838,7 @@ export default function WaveformEditor({
           const ab = beatsRef.current;
           const n = Math.min(mb.length, ab.length);
           if (n >= 2 && midiT >= mb[0] && midiT <= mb[n - 1]) {
-            handleSeek(warpMidiTime(midiT));
+            handleSeek(midiToDisp(midiT));
           }
         }
 
@@ -981,7 +1007,8 @@ export default function WaveformEditor({
     const data = imageData.data;
 
     for (let x = 0; x < width; x++) {
-      const t = (scrollLeft + x) / pxPerSec;
+      // Display x is stretched time; spectrogram columns are in original time.
+      const t = s2o((scrollLeft + x) / pxPerSec);
       const col = Math.floor(t * colsPerSec);
       if (col < 0 || col >= cols) continue;
       const colBase = col * bins;
@@ -1010,7 +1037,8 @@ export default function WaveformEditor({
   // ── Piano Roll helpers ─────────────────────────────────────────────────────
   // Convert a canvas x-pixel to MIDI time (inverse-warp if beats are aligned)
   function canvasXToMidiTime(x: number): number {
-    const audioT = (scrollLeftRef.current + KEYBOARD_W + x) / zoomPxPerSecRef.current;
+    // x is on the display (stretched) axis; map to original audio time first.
+    const audioT = s2o((scrollLeftRef.current + KEYBOARD_W + x) / zoomPxPerSecRef.current);
     const mb = midiBeatsRef.current;
     const ab = beatsRef.current;
     const n = Math.min(mb.length, ab.length);
@@ -1041,7 +1069,7 @@ export default function WaveformEditor({
     const ab = beatsRef.current;
     const hasWarp = mb.length > 0 && ab.length > 0;
     for (const bt of mb) {
-      const t  = hasWarp ? warpMidiTime(bt) : bt;
+      const t  = hasWarp ? o2s(warpMidiTime(bt)) : bt;
       const bx = t * pxPerSec - scrollLeft;
       if (Math.abs(x - bx) <= HIT) return bt;
     }
@@ -1087,8 +1115,9 @@ export default function WaveformEditor({
     }
 
     // ── Note rendering ─────────────────────────────────────────────────────────
+    // Positions use display (stretched) time via midiToDisp, matching the
+    // waveform's axis. tStart/tEnd cull off-screen notes in the same space.
     const opts = rollOptionsRef.current;
-    const hasWarp = midiBeatsRef.current.length > 0 && beatsRef.current.length > 0;
     const tStart = scrollLeft / pxPerSec;
     const tEnd   = (scrollLeft + width) / pxPerSec;
 
@@ -1129,8 +1158,8 @@ export default function WaveformEditor({
       const glBoost  = opts.gridLock ? 0.3 + glScore * 1.4 : 1.0;
 
       for (const note of tracks[ti].notes) {
-        const t0 = hasWarp ? warpMidiTime(note.time) : note.time;
-        const t1 = hasWarp ? warpMidiTime(note.time + note.dur) : note.time + note.dur;
+        const t0 = midiToDisp(note.time);
+        const t1 = midiToDisp(note.time + note.dur);
         if (t1 < tStart || t0 > tEnd) continue;
         const durAudio = t1 - t0;
         const x = t0 * pxPerSec - scrollLeft;
@@ -1177,7 +1206,7 @@ export default function WaveformEditor({
         if (solo !== null && ti !== solo) continue;
         const fc = tracks[ti].isPiano ? '#ffffff' : (trackColors[ti] ?? '#fff');
         for (const note of tracks[ti].notes) {
-          const t0 = hasWarp ? warpMidiTime(note.time) : note.time;
+          const t0 = midiToDisp(note.time);
           if (t0 < tStart || t0 > tEnd) continue;
           const x = t0 * pxPerSec - scrollLeft;
           ctx.globalAlpha = 0.5 + note.vel * 0.5;
@@ -1193,7 +1222,7 @@ export default function WaveformEditor({
     // MIDI beat markers
     const selBeat = selectedMidiBeatRef.current;
     for (const bt of mb) {
-      const t = hasWarp ? warpMidiTime(bt) : bt;
+      const t = midiToDisp(bt);
       const x = t * pxPerSec - scrollLeft;
       if (x < -4 || x > width + 4) continue;
       const isSel = selBeat !== null && Math.abs(bt - selBeat) < 0.001;
@@ -1225,7 +1254,7 @@ export default function WaveformEditor({
     ctx.globalAlpha = 1;
 
     // MIDI cursor
-    const cursorT = hasWarp ? warpMidiTime(midiCursorRef.current) : midiCursorRef.current;
+    const cursorT = midiToDisp(midiCursorRef.current);
     const cx = cursorT * pxPerSec - scrollLeft;
     if (cx >= 0 && cx <= width) {
       ctx.strokeStyle = selectedTimelineRef.current === 'midi' ? '#44ff88' : '#ffdd44';
@@ -1425,8 +1454,10 @@ export default function WaveformEditor({
     for (let ti = 0; ti < midiTracksRef.current.length; ti++) {
       if (solo !== null && ti !== solo) continue;
       for (const note of midiTracksRef.current[ti].notes) {
-        const noteAudioStart = warpMidiTime(note.time);
-        const noteAudioEnd   = warpMidiTime(note.time + note.dur);
+        // Schedule on the display (stretched) axis so MIDI follows stretches
+        // and stays locked to the stretched audio during play-both.
+        const noteAudioStart = midiToDisp(note.time);
+        const noteAudioEnd   = midiToDisp(note.time + note.dur);
         if (noteAudioEnd < already) continue;
         if (noteAudioStart >= scheduleUpto) break; // warp is monotone so break is safe
         if (noteAudioStart < already) continue;
@@ -1455,13 +1486,13 @@ export default function WaveformEditor({
     const ctx = midiAudioCtxRef.current;
     if (!ctx || !midiPlayingRef.current) return;
     const elapsed  = ctx.currentTime - midiStartWallRef.current;
-    const audioNow = midiStartAudioRef.current + elapsed;
+    const audioNow = midiStartAudioRef.current + elapsed; // display (stretched) time
     // Keep midiCursorRef in MIDI time so beat-tapping still works
-    midiCursorRef.current = audioTimeToMidiTime(audioNow);
+    midiCursorRef.current = dispToMidi(audioNow);
     drawPianoRoll();
     midiDispFrameRef.current++;
     if (midiDispFrameRef.current % 6 === 0) setMidiCursorDisp(midiCursorRef.current);
-    if (audioNow < warpMidiTime(midiDurationRef.current) + 1) {
+    if (audioNow < midiToDisp(midiDurationRef.current) + 1) {
       midiCursorRafRef.current = requestAnimationFrame(midiCursorLoop);
     } else {
       midiPause();
@@ -1488,7 +1519,7 @@ export default function WaveformEditor({
     }
 
     const pos      = from ?? midiCursorRef.current;
-    const audioPos = warpMidiTime(pos);
+    const audioPos = midiToDisp(pos); // display (stretched) time
     midiStartPosRef.current    = pos;
     midiStartAudioRef.current  = audioPos;
     midiStartWallRef.current   = ctx.currentTime;
@@ -1506,7 +1537,7 @@ export default function WaveformEditor({
     const ctx = midiAudioCtxRef.current;
     if (ctx && midiPlayingRef.current) {
       const elapsed = ctx.currentTime - midiStartWallRef.current;
-      midiCursorRef.current = audioTimeToMidiTime(midiStartAudioRef.current + elapsed);
+      midiCursorRef.current = dispToMidi(midiStartAudioRef.current + elapsed);
     }
     // Kill all scheduled notes immediately with a short fade to avoid clicks
     if (ctx) {
@@ -1700,18 +1731,20 @@ export default function WaveformEditor({
         const result = await invoke<LoadResult>("load_audio", { path: mp3Path });
         if (cancelled) return;
         setLoadProgress(80);
-        setDuration(result.duration);
-        durationRef.current = result.duration;
+        // result.duration is the ORIGINAL recording duration; the display axis
+        // is stretched time. With no stretches these are equal.
+        origDurationRef.current = result.duration;
+        segmentsRef.current = buildSegments(result.duration, stretchesRef.current);
+        const dispDur = stretchedDuration(result.duration, stretchesRef.current);
+        setDuration(dispDur);
+        durationRef.current = dispDur;
 
         const ws = wsRef.current;
         if (!ws) return;
 
-        // WaveSurfer always shows the original waveform (original time axis).
-        // Cursor is driven by original-time position events — no remapping needed.
-        // If stretches exist, pre-warm the engine's warped buffer so playback is ready.
-        if (stretchesRef.current.length > 0) {
-          invoke("set_stretches_audio", { stretches: stretchesRef.current }).catch(console.error);
-        }
+        // If stretches exist, the [stretches] effect reloads the waveform with
+        // the warped peaks once PCM is ready; here we just show the original
+        // peaks (correct shape when there are no stretches).
 
         // Decode both spectrogram layers (base64 → Uint8Array). Bytes are
         // linear-dB u8 (−90..0 dB); the live dials reconstruct dB and remap.
@@ -1731,11 +1764,11 @@ export default function WaveformEditor({
         specMidiHiRef.current = result.spec_midi_hi;
 
         const channelData = result.peaks.map(ch => new Float32Array(ch));
-        await ws.load("", channelData, result.duration);
+        await ws.load("", channelData, dispDur);
 
         if (bassWsRef.current && result.bass_peaks?.length) {
           const bassData = result.bass_peaks.map(ch => new Float32Array(ch));
-          bassWsRef.current.load("", bassData, result.duration).catch(() => {});
+          bassWsRef.current.load("", bassData, dispDur).catch(() => {});
         }
       } catch (e) {
         if (!cancelled) setLoadError(String(e));
@@ -1787,6 +1820,8 @@ export default function WaveformEditor({
   // ── Listen to Rust position events ────────────────────────────────────────
   useEffect(() => {
     const unlisten = listen<PositionEvent>("audio-position", (ev) => {
+      // Engine reports position in ORIGINAL time. Beat-tick detection compares
+      // against beats (also original); the cursor displays in stretched time.
       const { t, playing: p } = ev.payload;
 
       // Beat tick: detect when playback crosses a beat timestamp.
@@ -1798,15 +1833,16 @@ export default function WaveformEditor({
       }
       lastAudioPosRef.current = t;
 
-      setCurrentTime(t);
-      currentTimeRef.current = t;
+      const dispT = o2s(t);
+      setCurrentTime(dispT);
+      currentTimeRef.current = dispT;
       setPlaying(p);
       playingRef.current = p;
 
       const ws = wsRef.current;
       const dur = durationRef.current;
       if (ws && dur > 0) {
-        const pos = Math.max(0, Math.min(t / dur, 1));
+        const pos = Math.max(0, Math.min(dispT / dur, 1));
         ws.seekTo(pos);
         bassWsRef.current?.seekTo(pos);
       }
@@ -1814,13 +1850,51 @@ export default function WaveformEditor({
     return () => { unlisten.then(fn => fn()); };
   }, []);
 
-  // ── Stretches → Rust engine sync ─────────────────────────────────────────
-  // WaveSurfer keeps the original waveform; we only update the engine.
+  // ── Stretches → Rust engine + rescaled waveform ──────────────────────────
+  // The engine applies the stretches and returns the warped peaks + duration;
+  // we reload WaveSurfer with them so the timeline visibly rescales. The cursor
+  // is kept at the same musical moment (cursor_orig → stretched).
   useEffect(() => {
     if (!ready) return;
-    invoke("set_stretches_audio", { stretches }).catch(console.error);
+    let cancelled = false;
+    // Fresh load with no stretches: the engine's warped buffer is already the
+    // original and the waveform already shows it — nothing to do (avoids a
+    // needless PCM wait + recompute on every open).
+    if (stretches.length === 0 &&
+        Math.abs(durationRef.current - origDurationRef.current) < 1e-6) {
+      return;
+    }
+    (async () => {
+      try {
+        const res = await invoke<{ peaks: number[][]; warped_duration: number; cursor_orig: number }>(
+          "set_stretches_audio", { stretches }
+        );
+        if (cancelled) return;
+        const ws = wsRef.current;
+        setDuration(res.warped_duration);
+        durationRef.current = res.warped_duration;
+        if (ws && res.peaks?.length) {
+          const channelData = res.peaks.map(ch => new Float32Array(ch));
+          await ws.load("", channelData, res.warped_duration);
+        }
+        // Reposition cursor to the same musical point on the new timeline.
+        const dispT = o2s(res.cursor_orig);
+        currentTimeRef.current = dispT;
+        setCurrentTime(dispT);
+        if (ws && res.warped_duration > 0) {
+          const pos = Math.max(0, Math.min(dispT / res.warped_duration, 1));
+          ws.seekTo(pos);
+          bassWsRef.current?.seekTo(pos);
+        }
+        drawSpectrogram();
+        drawPianoRoll();
+      } catch (e) {
+        console.error("set_stretches_audio:", e);
+      }
+    })();
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stretches]);
+  }, [stretches, ready]);
 
   // ── Keyboard handlers ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -1858,10 +1932,12 @@ export default function WaveformEditor({
         e.preventDefault();
         const sel = selectionRef.current;
         if (sel) {
-          const overlaps = stretchesRef.current.some(s => sel.end > s.start && sel.start < s.end);
-          if (!overlaps) setStretchModal({ start: sel.start, end: sel.end });
+          // Selection is in display (stretched) time; stretches store original time.
+          const so = s2o(sel.start), eo = s2o(sel.end);
+          const overlaps = stretchesRef.current.some(s => eo > s.start && so < s.end);
+          if (!overlaps) setStretchModal({ start: so, end: eo });
         } else {
-          const t = currentTimeRef.current;
+          const t = s2o(currentTimeRef.current);
           const active = stretchesRef.current.find(s => t >= s.start && t <= s.end);
           if (active) setStretchModal({ start: active.start, end: active.end, existingFactor: active.factor });
         }
@@ -1877,7 +1953,7 @@ export default function WaveformEditor({
 
       if (e.code === "KeyB" && recordingRef.current) {
         e.preventDefault();
-        pendingTapsRef.current.push(currentTimeRef.current);
+        pendingTapsRef.current.push(s2o(currentTimeRef.current)); // store beats in original time
         return;
       }
 
@@ -2007,7 +2083,7 @@ export default function WaveformEditor({
     const scrollEl = ws.getWrapper().parentElement as HTMLElement | null;
     if (!scrollEl) return;
     const containerWidth = containerRef.current?.clientWidth ?? scrollEl.clientWidth;
-    const beatPx = beatTime * zoomPxPerSecRef.current;
+    const beatPx = o2s(beatTime) * zoomPxPerSecRef.current; // beat stored in original time
     const viewportX = beatPx - scrollLeftRef.current;
     let newScrollLeft: number | null = null;
     if (viewportX < 0.25 * containerWidth)
@@ -2019,14 +2095,15 @@ export default function WaveformEditor({
   }
 
   // ── Seek helper ───────────────────────────────────────────────────────────
-  // Updates WaveSurfer cursor immediately (no round-trip) AND notifies Rust.
+  // `t` is in display (stretched) time. WaveSurfer cursor uses it directly; the
+  // engine expects original time, so convert at the boundary.
   function handleSeek(t: number) {
     const ws = wsRef.current;
     const dur = durationRef.current;
     if (ws && dur > 0) {
       ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
     }
-    invoke("seek_audio", { t }).catch(console.error);
+    invoke("seek_audio", { t: s2o(t) }).catch(console.error);
   }
 
   // ── Playback helpers ───────────────────────────────────────────────────────
@@ -2036,7 +2113,7 @@ export default function WaveformEditor({
     } else {
       // Seek before play to avoid a race where a recent click-to-seek hasn't
       // reached Rust yet and play_audio would start from the wrong position.
-      invoke("seek_audio", { t: currentTimeRef.current })
+      invoke("seek_audio", { t: s2o(currentTimeRef.current) })
         .then(() => invoke("play_audio"))
         .catch(console.error);
     }
@@ -2047,7 +2124,7 @@ export default function WaveformEditor({
       invoke("pause_audio").catch(console.error);
       midiPause();
     } else {
-      invoke("seek_audio", { t: currentTimeRef.current })
+      invoke("seek_audio", { t: s2o(currentTimeRef.current) })
         .then(() => invoke("play_audio"))
         .catch(console.error);
       midiPlay();
@@ -2056,7 +2133,7 @@ export default function WaveformEditor({
 
   // ── Recording helpers ──────────────────────────────────────────────────────
   function startRecording() {
-    recordingStartTimeRef.current = currentTimeRef.current;
+    recordingStartTimeRef.current = s2o(currentTimeRef.current); // original time
     pendingTapsRef.current = [];
     recordingRef.current = true;
     setRecording(true);
@@ -2066,8 +2143,8 @@ export default function WaveformEditor({
   function stopRecording() {
     recordingRef.current = false;
     setRecording(false);
-    const startTime = recordingStartTimeRef.current;
-    const endTime = currentTimeRef.current;
+    const startTime = recordingStartTimeRef.current;     // original time
+    const endTime = s2o(currentTimeRef.current);          // original time
     const taps = pendingTapsRef.current;
     pendingTapsRef.current = [];
     const kept = beatsRef.current.filter(t => t < startTime || t > endTime);
@@ -2195,9 +2272,9 @@ export default function WaveformEditor({
       const isSelected = selectedBeatTime !== null && Math.abs(t - selectedBeatTime) < 0.001;
 
       const markerEl = document.createElement('div');
-      markerEl.dataset.beatTime = String(t);
+      markerEl.dataset.beatTime = String(t); // stored in original time
       Object.assign(markerEl.style, {
-        position: 'absolute', top: '0', left: `${t * zoomPxPerSecRef.current}px`,
+        position: 'absolute', top: '0', left: `${o2s(t) * zoomPxPerSecRef.current}px`,
         width: '8px', height: '100%', cursor: 'grab',
         transform: 'translateX(-4px)',
       });
@@ -2239,9 +2316,9 @@ export default function WaveformEditor({
         regionJustClickedRef.current = true;
 
         const startClientX = e.clientX;
-        const startPixel = t * zoomPxPerSecRef.current;
+        const startPixel = o2s(t) * zoomPxPerSecRef.current; // on-screen (stretched) pixel
         let dragging = false;
-        let newTime = t;
+        let newTime = t; // beat time STORED in original
 
         function onMove(ev: PointerEvent) {
           const dx = ev.clientX - startClientX;
@@ -2250,8 +2327,9 @@ export default function WaveformEditor({
             markerEl.style.cursor = 'grabbing';
           }
           if (dragging) {
-            newTime = Math.max(0, Math.min((startPixel + dx) / zoomPxPerSecRef.current, durationRef.current));
-            markerEl.style.left = `${newTime * zoomPxPerSecRef.current}px`;
+            const sT = Math.max(0, Math.min((startPixel + dx) / zoomPxPerSecRef.current, durationRef.current));
+            newTime = s2o(sT); // convert display position back to original time
+            markerEl.style.left = `${sT * zoomPxPerSecRef.current}px`;
 
             // Update BPM labels in real-time
             const ab = beatsRef.current;
@@ -2312,9 +2390,11 @@ export default function WaveformEditor({
     inner.style.width = `${Math.max(durationRef.current * zoomPxPerSec, 1)}px`;
     inner.querySelectorAll<HTMLElement>('[data-beat-time]').forEach(el => {
       const t = parseFloat(el.dataset.beatTime!);
-      el.style.left = `${t * zoomPxPerSec}px`;
+      el.style.left = `${o2s(t) * zoomPxPerSec}px`;
     });
-  }, [zoomPxPerSec, ready]);
+  // Reposition on stretch change too: o2s shifts even when beats are unchanged.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoomPxPerSec, ready, stretches]);
 
   // ── Beat label overlap culling ─────────────────────────────────────────────
   // Greedy left-to-right pass: hide a label if it would overlap the previous
@@ -2327,7 +2407,7 @@ export default function WaveformEditor({
       const el = beatLabelElsRef.current.get(t);
       if (!el) return;
       const bpm = i < beats.length - 1 ? 60 / (beats[i + 1] - t) : null;
-      const labelPx = t * zoomPxPerSec;
+      const labelPx = o2s(t) * zoomPxPerSec;
       const estimatedWidth = bpm !== null ? String(Math.round(bpm)).length * CHAR_WIDTH_PX : 0;
       if (labelPx >= lastVisibleRight) {
         el.style.display = 'block';
@@ -2336,7 +2416,8 @@ export default function WaveformEditor({
         el.style.display = 'none';
       }
     });
-  }, [beats, zoomPxPerSec, ready]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [beats, zoomPxPerSec, ready, stretches]);
 
   // ── Selection region sync ──────────────────────────────────────────────────
   useEffect(() => {
@@ -2372,8 +2453,8 @@ export default function WaveformEditor({
 
       rp.addRegion({
         id: `stretch-${i}`,
-        start: s.start,
-        end: s.end,
+        start: o2s(s.start), // overlay spans the stretched region on the display axis
+        end: o2s(s.end),
         color: s.factor >= 1 ? "rgba(34, 197, 94, 0.12)" : "rgba(239, 68, 68, 0.12)",
         drag: false,
         resize: false,
@@ -2578,9 +2659,12 @@ export default function WaveformEditor({
 
           {/* Stretch */}
           {(() => {
-            const activeStretch = stretches.find(s => currentTime >= s.start && currentTime <= s.end) ?? null;
-            const selectionOverlapsStretch = selection !== null &&
-              stretches.some(s => selection.end > s.start && selection.start < s.end);
+            // currentTime / selection are display (stretched) time; stretches are original.
+            const curOrig = s2o(currentTime);
+            const selOrig = selection ? { start: s2o(selection.start), end: s2o(selection.end) } : null;
+            const activeStretch = stretches.find(s => curOrig >= s.start && curOrig <= s.end) ?? null;
+            const selectionOverlapsStretch = selOrig !== null &&
+              stretches.some(s => selOrig.end > s.start && selOrig.start < s.end);
             const canStretch = !selectionOverlapsStretch && (!!selection || !!activeStretch);
             const isActive = !!selection || !!activeStretch;
             const title = selectionOverlapsStretch
@@ -2596,8 +2680,8 @@ export default function WaveformEditor({
                   className={`transport-btn stretch-btn${isActive && !selectionOverlapsStretch ? " stretch-btn-active" : ""}`}
                   onClick={() => {
                     if (!canStretch) return;
-                    if (selection) {
-                      setStretchModal({ start: selection.start, end: selection.end });
+                    if (selOrig) {
+                      setStretchModal({ start: selOrig.start, end: selOrig.end });
                     } else if (activeStretch) {
                       setStretchModal({ start: activeStretch.start, end: activeStretch.end, existingFactor: activeStretch.factor });
                     }
@@ -2812,7 +2896,7 @@ export default function WaveformEditor({
 
       {videoModalOpen && (
         <ExportVideoModal
-          totalDuration={stretchedDuration(duration, stretches)}
+          totalDuration={duration}
           onConfirm={handleVideoExport}
           onCancel={() => setVideoModalOpen(false)}
         />

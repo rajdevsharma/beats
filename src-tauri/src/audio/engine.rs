@@ -346,6 +346,7 @@ impl LoadResult {
 pub struct SetStretchesResult {
     pub peaks: Vec<Vec<f32>>,
     pub warped_duration: f64,
+    pub cursor_orig: f64, // playback position in original-audio seconds after remap
 }
 
 // ── Tauri commands ─────────────────────────────────────────────────────────
@@ -548,7 +549,7 @@ pub async fn set_stretches_audio(
             }
         }
 
-        Ok(SetStretchesResult { peaks, warped_duration: new_warped_duration })
+        Ok(SetStretchesResult { peaks, warped_duration: new_warped_duration, cursor_orig: orig_t })
     })
     .await
     .map_err(|e| e.to_string())?

@@ -542,8 +542,12 @@ export default function WaveformEditor({
       cursorWidth: 2,
       height: containerRef.current.clientHeight || 128,
       normalize: true,
-      autoScroll: true,
-      autoCenter: true,
+      // autoScroll off: WaveSurfer's scrollIntoView forced a layout reflow on
+      // every frame (it reads scrollWidth right after renderProgress mutates
+      // styles). We do our own page-flip follow instead — see the position
+      // listener — which only touches scrollLeft when the cursor nears the edge.
+      autoScroll: false,
+      autoCenter: false,
       interact: true,
       plugins: [
         Timeline.create({ style: { color: "#a0a0b0", fontSize: "11px" } }),
@@ -2014,10 +2018,10 @@ export default function WaveformEditor({
       }
       playingRef.current = p;
 
-      // Move the cursor (WaveSurfer.seekTo → its auto-center scrollIntoView,
-      // which forces a layout reflow + waveform re-render). The engine emits at
-      // ~60 Hz; a 30 Hz cursor looks smooth and halves that reflow cost. Always
-      // apply the final frame on pause so the cursor lands exactly.
+      // Move the cursor via WaveSurfer.seekTo. autoScroll is off (it forced a
+      // per-frame reflow), so we page-flip the view ourselves only when the
+      // cursor nears the right edge. Throttled to ~30 Hz; always apply the final
+      // frame on pause so the cursor lands exactly.
       const ws = wsRef.current;
       const dur = durationRef.current;
       if (ws && dur > 0 && (playChanged || now - lastSeekRef.current > 32)) {
@@ -2025,6 +2029,20 @@ export default function WaveformEditor({
         const pos = Math.max(0, Math.min(dispT / dur, 1));
         ws.seekTo(pos);
         bassWsRef.current?.seekTo(pos);
+
+        // Page-flip follow: when playing and the cursor passes ~85% of the
+        // viewport, jump it back near the left so a fresh page is visible ahead.
+        if (p) {
+          const scrollEl = ws.getWrapper().parentElement as HTMLElement | null;
+          if (scrollEl) {
+            const vw = scrollEl.clientWidth;
+            const cursorPx = dispT * zoomPxPerSecRef.current;
+            const rel = cursorPx - scrollEl.scrollLeft;
+            if (rel > vw * 0.85 || rel < 0) {
+              scrollEl.scrollLeft = Math.max(0, cursorPx - vw * 0.15);
+            }
+          }
+        }
       }
     });
     return () => { unlisten.then(fn => fn()); };

@@ -31,7 +31,9 @@ const SALAMANDER_NOTES: [string, number][] = [
 
 class PianoSampler {
   private buffers = new Map<number, AudioBuffer>();
+  private raw: Map<number, ArrayBuffer> | null = null;
   private fetchPromise: Promise<void> | null = null;
+  private decodePromise: Promise<void> | null = null;
 
   // Phase 1: download MP3 bytes (no AudioContext needed, safe before user gesture)
   fetch(onProgress?: (loaded: number, total: number) => void): Promise<void> {
@@ -41,27 +43,39 @@ class PianoSampler {
     this.fetchPromise = Promise.all(
       SALAMANDER_NOTES.map(async ([name, midi]) => {
         const res = await fetch(`${SALAMANDER_BASE}${name}.mp3`);
+        if (!res.ok) throw new Error(`${name}.mp3 → HTTP ${res.status}`);
         rawBuffers.set(midi, await res.arrayBuffer());
         onProgress?.(++loaded, SALAMANDER_NOTES.length);
       })
-    ).then(async () => {
-      // Phase 2 is kicked off by decode() — store raw so decode() can use them
-      (this as any)._raw = rawBuffers;
-    });
+    ).then(() => { this.raw = rawBuffers; });
     return this.fetchPromise;
   }
 
-  // Phase 2: decode ArrayBuffers using the live AudioContext (call after fetch resolves)
-  async decode(ctx: AudioContext): Promise<void> {
-    const raw: Map<number, ArrayBuffer> = (this as any)._raw;
-    if (!raw) return;
-    await Promise.all(
-      Array.from(raw.entries()).map(async ([midi, ab]) => {
-        const buf = await ctx.decodeAudioData(ab);
-        this.buffers.set(midi, buf);
-      })
-    );
-    (this as any)._raw = null;
+  // Phase 2: fetch (if needed) then decode. Cached so concurrent callers share
+  // one decode (no partial-buffer race). On failure everything resets so a
+  // later call retries from scratch (handles a flaky CDN download).
+  decode(ctx: AudioContext, onProgress?: (loaded: number, total: number) => void): Promise<void> {
+    if (this.isReady) return Promise.resolve();
+    if (this.decodePromise) return this.decodePromise;
+    this.decodePromise = this.fetch(onProgress).then(async () => {
+      const raw = this.raw;
+      if (!raw) throw new Error("samples missing after fetch");
+      await Promise.all(
+        Array.from(raw.entries()).map(async ([midi, ab]) => {
+          // slice(0): decodeAudioData detaches its input; keep the original intact
+          const buf = await ctx.decodeAudioData(ab.slice(0));
+          this.buffers.set(midi, buf);
+        })
+      );
+      this.raw = null;
+    }).catch((e) => {
+      this.fetchPromise = null;
+      this.decodePromise = null;
+      this.raw = null;
+      this.buffers.clear();
+      throw e;
+    });
+    return this.decodePromise;
   }
 
   get isReady() { return this.buffers.size === SALAMANDER_NOTES.length; }
@@ -1008,16 +1022,11 @@ export default function WaveformEditor({
         drawPianoRoll();
         drawPianoKeyboard();
 
-        // Eagerly prefetch Steinway samples as soon as MIDI loads — no AudioContext
-        // needed for the download phase, so this is safe before any user gesture.
-        if (tracks.some(t => t.isPiano) && !globalPianoSampler?.isReady) {
-          if (!globalPianoSampler) globalPianoSampler = new PianoSampler();
-          setSamplerStatus('loading');
+        // Eagerly fetch AND decode the Steinway samples as soon as MIDI loads so
+        // the sampler is actually ready (status → 🎹) before the first play.
+        if (tracks.some(t => t.isPiano)) {
           setSamplerProgress(0);
-          globalPianoSampler.fetch((n, total) =>
-            setSamplerProgress(Math.round(n / total * 100))
-          ).catch(() => setSamplerStatus('error'));
-          // Decode happens in midiPlay() once the AudioContext exists.
+          loadSampler().catch(() => { /* status already set to 'error' */ });
         }
       } catch (e) {
         if (!cancelled) console.error('MIDI load failed:', e);
@@ -1524,6 +1533,25 @@ export default function WaveformEditor({
     return midiAudioCtxRef.current;
   }
 
+  // Fetch + decode the Steinway samples and drive the status UI. Idempotent and
+  // safe to call eagerly (on MIDI load), on play, or as a retry. Returns once
+  // the sampler is ready (or throws on failure). Awaited by midiPlay so the
+  // first notes use real samples instead of the synth fallback.
+  async function loadSampler(): Promise<void> {
+    if (!globalPianoSampler) globalPianoSampler = new PianoSampler();
+    const s = globalPianoSampler;
+    if (s.isReady) { setSamplerStatus('ready'); return; }
+    setSamplerStatus('loading');
+    try {
+      await s.decode(getMidiCtx(), (n, total) => setSamplerProgress(Math.round((n / total) * 100)));
+      setSamplerStatus(s.isReady ? 'ready' : 'error');
+    } catch (e) {
+      console.error('Steinway sample load failed:', e);
+      setSamplerStatus('error');
+      throw e;
+    }
+  }
+
   function scheduleMidiNote(ctx: AudioContext, out: AudioNode, pitch: number, vel: number, wallStart: number, dur: number) {
     const freq = 440 * Math.pow(2, (pitch - 69) / 12);
     const osc  = ctx.createOscillator();
@@ -1717,20 +1745,15 @@ export default function WaveformEditor({
   async function midiPlay(from?: number) {
     const ctx = getMidiCtx();
 
-    // Decode pre-fetched samples if piano is audible and samples aren't decoded yet.
-    // Fetch already started on MIDI load; this only runs the fast decode step.
+    // Ensure samples are ready before scheduling, so the first notes use the
+    // real piano rather than the synth fallback. loadSampler is cached, so this
+    // just awaits the eager load already in flight from MIDI-load.
     const solo = soloTrackIndexRef.current;
     const pianoVisible = midiTracksRef.current.some((t, i) =>
       t.isPiano && (solo === null || solo === i)
     );
-    if (pianoVisible && globalPianoSampler && !globalPianoSampler.isReady) {
-      try {
-        await globalPianoSampler.fetch(); // no-op if already fetched; waits if still in progress
-        await globalPianoSampler.decode(ctx);
-        setSamplerStatus('ready');
-      } catch {
-        setSamplerStatus('error');
-      }
+    if (pianoVisible && !globalPianoSampler?.isReady) {
+      try { await loadSampler(); } catch { /* fall back to synth */ }
     }
 
     const pos      = from ?? midiCursorRef.current;
@@ -3031,8 +3054,13 @@ export default function WaveformEditor({
             </span>
           )}
           {samplerStatus === 'error' && (
-            <span className="sampler-status sampler-error" title="Could not load samples — using synthesis">
-              ⚠ samples unavailable
+            <span
+              className="sampler-status sampler-error"
+              title="Could not load samples — using synthesis. Click to retry."
+              style={{ cursor: 'pointer' }}
+              onClick={() => { setSamplerProgress(0); loadSampler().catch(() => {}); }}
+            >
+              ⚠ samples unavailable — retry
             </span>
           )}
 

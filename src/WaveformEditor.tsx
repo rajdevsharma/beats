@@ -406,6 +406,15 @@ export default function WaveformEditor({
   const specLutRef = useRef<Uint8ClampedArray>(new Uint8ClampedArray(256 * 4));
   const specLutKeyRef = useRef<string>("");
   const specImageDataRef = useRef<ImageData | null>(null);
+  // Offscreen buffer: the spectrogram is rasterized (slow putImageData) into a
+  // canvas wider than the viewport, then scrolling just blits the visible slice
+  // with drawImage (GPU). Re-rasterized only when the view leaves the buffer or
+  // its content key changes.
+  const specBufRef = useRef<HTMLCanvasElement | null>(null);
+  const specBufStartRef = useRef(0);   // display px the buffer's left edge maps to
+  const specBufKeyRef = useRef<string>("");
+  const specStretchVerRef = useRef(0); // bumped when the stretch mapping changes
+  const specDataVerRef = useRef(0);    // bumped when spectrogram data is (re)loaded
   const scrollLeftRef = useRef(0);
   const [showSpec, setShowSpec] = useState(() =>
     localStorage.getItem("beats_show_spec") !== "false"
@@ -494,6 +503,7 @@ export default function WaveformEditor({
     const sorted = [...stretches].sort((a, b) => a.start - b.start);
     stretchesRef.current = sorted;
     segmentsRef.current = buildSegments(origDurationRef.current, sorted);
+    specStretchVerRef.current++; // invalidate spectrogram buffer (s2o mapping changed)
     rebuildMidiDispCache();
   }, [stretches]);
   useEffect(() => { onBeatsChangeRef.current = onBeatsChange; }, [onBeatsChange]);
@@ -1046,49 +1056,75 @@ export default function WaveformEditor({
     }
     const lut = specLutRef.current;
 
-    // Per output row: fractional bin + interpolation tap (constant across x).
-    const b0 = new Int32Array(height);
-    const b1 = new Int32Array(height);
-    const bf = new Float32Array(height);
-    for (let y = 0; y < height; y++) {
-      const midi = viewHi - (y / height) * (viewHi - viewLo);
-      const fb = midiSpan > 0 ? ((midi - midiLo) / midiSpan) * (bins - 1) : 0;
-      const lo = Math.floor(fb);
-      const hi = Math.min(bins - 1, lo + 1);
-      b0[y] = Math.max(0, Math.min(bins - 1, lo));
-      b1[y] = Math.max(0, hi);
-      bf[y] = fb - lo;
-    }
+    // Buffer covers the viewport plus one viewport of margin on each side, so
+    // forward/backward playback can scroll ~1 viewport before needing a re-raster.
+    const MARGIN = width;
+    const bufW = width + MARGIN * 2;
+    // Total scrollable width is the (stretched) display duration × pxPerSec.
+    const maxStart = Math.max(0, durationRef.current * pxPerSec - bufW);
+    const key = `${ctrl.mode}|${specLutKeyRef.current}|${viewLo}|${viewHi}|${pxPerSec}|`
+              + `${height}|${bins}|${colsPerSec}|${specStretchVerRef.current}|${specDataVerRef.current}|${bufW}`;
 
-    // Reuse the ImageData buffer across frames (re-create only on resize).
-    let imageData = specImageDataRef.current;
-    if (!imageData || imageData.width !== width || imageData.height !== height) {
-      imageData = ctx.createImageData(width, height);
-      specImageDataRef.current = imageData;
-    }
-    const data = imageData.data;
+    const viewInBuf = scrollLeft >= specBufStartRef.current
+                   && scrollLeft + width <= specBufStartRef.current + bufW;
+    if (!specBufRef.current || specBufKeyRef.current !== key || !viewInBuf) {
+      // ── Re-rasterize the offscreen buffer (the expensive path) ──────────────
+      let buf = specBufRef.current;
+      if (!buf) { buf = document.createElement('canvas'); specBufRef.current = buf; }
+      if (buf.width !== bufW || buf.height !== height) { buf.width = bufW; buf.height = height; }
+      const bctx = buf.getContext('2d');
+      if (!bctx) return;
 
-    for (let x = 0; x < width; x++) {
-      // Display x is stretched time; spectrogram columns are in original time.
-      const t = s2o((scrollLeft + x) / pxPerSec);
-      const col = Math.floor(t * colsPerSec);
-      const valid = col >= 0 && col < cols;
-      const colBase = col * bins;
+      const bufStart = Math.min(maxStart, Math.max(0, Math.floor(scrollLeft - MARGIN)));
 
+      // Per output row: fractional bin + interpolation tap (constant across x).
+      const b0 = new Int32Array(height);
+      const b1 = new Int32Array(height);
+      const bf = new Float32Array(height);
       for (let y = 0; y < height; y++) {
-        const idx = (y * width + x) * 4;
-        if (!valid) { data[idx + 3] = 0; continue; } // clear stale pixel
-        // Vertically interpolate between adjacent pitch bins, then LUT.
-        const u8 = (specData[colBase + b0[y]] * (1 - bf[y]) + specData[colBase + b1[y]] * bf[y] + 0.5) | 0;
-        const o = u8 * 4;
-        data[idx]     = lut[o];
-        data[idx + 1] = lut[o + 1];
-        data[idx + 2] = lut[o + 2];
-        data[idx + 3] = lut[o + 3];
+        const midi = viewHi - (y / height) * (viewHi - viewLo);
+        const fb = midiSpan > 0 ? ((midi - midiLo) / midiSpan) * (bins - 1) : 0;
+        const lo = Math.floor(fb);
+        const hi = Math.min(bins - 1, lo + 1);
+        b0[y] = Math.max(0, Math.min(bins - 1, lo));
+        b1[y] = Math.max(0, hi);
+        bf[y] = fb - lo;
       }
+
+      let imageData = specImageDataRef.current;
+      if (!imageData || imageData.width !== bufW || imageData.height !== height) {
+        imageData = bctx.createImageData(bufW, height);
+        specImageDataRef.current = imageData;
+      }
+      const data = imageData.data;
+
+      for (let x = 0; x < bufW; x++) {
+        // Display px is stretched time; spectrogram columns are in original time.
+        const t = s2o((bufStart + x) / pxPerSec);
+        const col = Math.floor(t * colsPerSec);
+        const valid = col >= 0 && col < cols;
+        const colBase = col * bins;
+        for (let y = 0; y < height; y++) {
+          const idx = (y * bufW + x) * 4;
+          if (!valid) { data[idx + 3] = 0; continue; }
+          const u8 = (specData[colBase + b0[y]] * (1 - bf[y]) + specData[colBase + b1[y]] * bf[y] + 0.5) | 0;
+          const o = u8 * 4;
+          data[idx]     = lut[o];
+          data[idx + 1] = lut[o + 1];
+          data[idx + 2] = lut[o + 2];
+          data[idx + 3] = lut[o + 3];
+        }
+      }
+      bctx.putImageData(imageData, 0, 0);
+      specBufStartRef.current = bufStart;
+      specBufKeyRef.current = key;
     }
 
-    ctx.putImageData(imageData, 0, 0);
+    // ── Cheap path: blit the visible slice of the buffer (GPU drawImage) ───────
+    const buf = specBufRef.current!;
+    const sx = Math.max(0, Math.min(bufW - width, scrollLeft - specBufStartRef.current));
+    ctx.clearRect(0, 0, width, height);
+    ctx.drawImage(buf, sx, 0, width, height, 0, 0, width, height);
   }
 
   // ── Piano Roll helpers ─────────────────────────────────────────────────────
@@ -1891,6 +1927,7 @@ export default function WaveformEditor({
         specColsPerSecRef.current = result.spec_cols_per_sec;
         specMidiLoRef.current = result.spec_midi_lo;
         specMidiHiRef.current = result.spec_midi_hi;
+        specDataVerRef.current++; // invalidate spectrogram buffer for the new file
 
         const channelData = result.peaks.map(ch => new Float32Array(ch));
         await ws.load("", channelData, dispDur);

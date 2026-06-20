@@ -32,6 +32,12 @@ pub struct VideoOptions {
     pub fps: u32,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub beat_pulse: bool,
+    #[serde(default)]
+    pub orchestra_bars: bool,
+    #[serde(default)]
+    pub tempo_pendulum: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -132,6 +138,9 @@ pub async fn export_video(
             options.height,
             options.orientation == "horizontal",
             clip_dur,
+            options.beat_pulse,
+            options.orchestra_bars,
+            options.tempo_pendulum,
         );
 
         // ── Stage 5: render frames → ffmpeg (40–100 %) ─────────────────────
@@ -269,7 +278,7 @@ mod tests {
         // A doubling: orchestra on the same pitch as piano — piano must stay visible
         notes.push(SceneNote { start: 4.2, end: 6.0, pitch: 60, vel: 0.9, track: 1 });
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0)
+        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true)
     }
 
     #[test]

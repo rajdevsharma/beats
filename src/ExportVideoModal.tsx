@@ -4,7 +4,16 @@ export interface VideoExportOpts {
   orientation: "vertical" | "horizontal";
   start: number;
   end: number;
+  beatPulse: boolean;
+  orchestraBars: boolean;
+  tempoPendulum: boolean;
 }
+
+const CUES: { key: "beatPulse" | "orchestraBars" | "tempoPendulum"; label: string; desc: string }[] = [
+  { key: "beatPulse", label: "Beat pulse", desc: "Full-screen edge glow that swells into every beat — easy to catch in peripheral vision" },
+  { key: "orchestraBars", label: "Orchestra energy bars", desc: "Big edge bars showing how loud the orchestra is, colored by section, flashing on entrances" },
+  { key: "tempoPendulum", label: "Tempo pendulum", desc: "Large metronome bob sweeping side to side, hitting an extreme on each beat" },
+];
 
 interface Props {
   totalDuration: number; // full length of the stretched output, seconds
@@ -33,6 +42,13 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
   const [orientation, setOrientation] = useState<"vertical" | "horizontal">("vertical");
   const [startStr, setStartStr] = useState("0:00");
   const [endStr, setEndStr] = useState(formatTime(totalDuration));
+  const [cues, setCues] = useState<Record<string, boolean>>(() => {
+    try {
+      const raw = localStorage.getItem("beats_video_cues");
+      if (raw) return JSON.parse(raw);
+    } catch { /* ignore */ }
+    return { beatPulse: true, orchestraBars: true, tempoPendulum: false };
+  });
 
   const start = parseTime(startStr);
   const end = parseTime(endStr);
@@ -43,7 +59,13 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
 
   function handleConfirm() {
     if (!valid) return;
-    onConfirm({ orientation, start: start!, end: Math.min(end!, totalDuration) });
+    localStorage.setItem("beats_video_cues", JSON.stringify(cues));
+    onConfirm({
+      orientation, start: start!, end: Math.min(end!, totalDuration),
+      beatPulse: !!cues.beatPulse,
+      orchestraBars: !!cues.orchestraBars,
+      tempoPendulum: !!cues.tempoPendulum,
+    });
   }
 
   return (
@@ -106,6 +128,25 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
           <p className="modal-hint">
             Times are in the exported (stretched) timeline · full piece = {formatTime(totalDuration)}
           </p>
+
+          <div className="modal-divider" />
+
+          <div className="modal-row">
+            <span className="modal-label">Performance cues</span>
+          </div>
+          <div className="video-cues">
+            {CUES.map(c => (
+              <label key={c.key} className="video-cue" title={c.desc}>
+                <input
+                  type="checkbox"
+                  checked={!!cues[c.key]}
+                  onChange={e => setCues(prev => ({ ...prev, [c.key]: e.target.checked }))}
+                />
+                <span className="video-cue-label">{c.label}</span>
+                <span className="video-cue-desc">{c.desc}</span>
+              </label>
+            ))}
+          </div>
 
           {clipDur !== null && (
             <div className="modal-preview">

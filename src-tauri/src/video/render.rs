@@ -37,6 +37,11 @@ pub struct Scene {
     key_extent: f32,   // pixel extent across keys (width in vertical, height in horizontal)
     // Per-second buckets of note indices that need drawing during that second
     buckets: Vec<Vec<u32>>,
+    // Peripheral-vision performance cues (independently toggleable)
+    beat_pulse: bool,
+    orchestra_bars: bool,
+    tempo_pendulum: bool,
+    orch_norm: f32, // normalizer for orchestral concurrent-energy → [0,1]
 }
 
 const PARTICLE_MAX_LIFE: f64 = 0.85;
@@ -241,6 +246,9 @@ impl Scene {
         height: u32,
         horizontal: bool,
         clip_dur: f64,
+        beat_pulse: bool,
+        orchestra_bars: bool,
+        tempo_pendulum: bool,
     ) -> Scene {
         let (kb_size, hit, key_extent, lookahead) = if horizontal {
             let kb = (width as f32 * 0.085).clamp(110.0, 220.0);
@@ -256,6 +264,22 @@ impl Scene {
         };
         let pps = scroll_extent / lookahead as f32;
         beats.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Normalizer for the orchestra energy bars: peak concurrent non-piano
+        // velocity-sum across the clip, via a +start/-end sweep.
+        let mut events: Vec<(f64, f32)> = Vec::new();
+        for n in &notes {
+            if !tracks[n.track].is_piano {
+                events.push((n.start, n.vel));
+                events.push((n.end, -n.vel));
+            }
+        }
+        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let (mut running, mut orch_norm) = (0.0f32, 1e-3f32);
+        for (_, dv) in &events {
+            running += dv;
+            if running > orch_norm { orch_norm = running; }
+        }
 
         // Bucket notes by integer second of "needs drawing" interval:
         // visible from (start - lookahead) until particles finish (end + life).
@@ -282,6 +306,10 @@ impl Scene {
             hit,
             key_extent,
             buckets,
+            beat_pulse,
+            orchestra_bars,
+            tempo_pendulum,
+            orch_norm,
         }
     }
 
@@ -318,7 +346,199 @@ impl Scene {
         self.draw_particles(&mut pm, t, active);
         self.draw_conductor(&mut pm, t);
 
+        // Peripheral-vision performance cues, drawn on top (edge-anchored, big).
+        if self.orchestra_bars { self.draw_orchestra_bars(&mut pm, t, active); }
+        if self.tempo_pendulum { self.draw_tempo_pendulum(&mut pm, t); }
+        if self.beat_pulse { self.draw_beat_pulse(&mut pm, t); }
+
         pm.take()
+    }
+
+    // ── Peripheral beat pulse ───────────────────────────────────────────────
+    // A full-perimeter glow that swells just before each beat and decays after,
+    // identical for every beat — designed to register in peripheral vision.
+    fn beat_pulse_intensity(&self, t: f64) -> f32 {
+        const RAMP: f64 = 0.14;  // anticipatory build-up before the beat
+        const DECAY: f64 = 0.30; // fade after the beat
+        if self.beats.is_empty() { return 0.0; }
+        let i = self.beats.partition_point(|b| *b <= t);
+        let mut v = 0.0f32;
+        if i > 0 {
+            let dt = t - self.beats[i - 1];
+            if dt >= 0.0 && dt < DECAY {
+                let x = 1.0 - (dt / DECAY) as f32; // 1 at beat → 0
+                v = v.max(x * x);
+            }
+        }
+        if i < self.beats.len() {
+            let dt = self.beats[i] - t;
+            if dt >= 0.0 && dt < RAMP {
+                let x = 1.0 - (dt / RAMP) as f32; // 0 → 1 at beat
+                v = v.max(x * x);
+            }
+        }
+        v
+    }
+
+    fn draw_beat_pulse(&self, pm: &mut Pixmap, t: f64) {
+        let intensity = self.beat_pulse_intensity(t);
+        if intensity <= 0.003 { return; }
+        let w = self.width as f32;
+        let h = self.height as f32;
+        let color = [255, 196, 120]; // warm amber
+        let a = intensity * 0.55;
+        let band = (w.min(h) * 0.16).max(40.0);
+
+        // Four edge gradients fading inward (additive bloom).
+        let edge = |pm: &mut Pixmap, from: (f32, f32), to: (f32, f32), x: f32, y: f32, bw: f32, bh: f32| {
+            if let Some(p) = linear_grad(
+                from, to,
+                vec![
+                    GradientStop::new(0.0, rgba(color, a)),
+                    GradientStop::new(1.0, rgba(color, 0.0)),
+                ],
+                BlendMode::Plus,
+            ) {
+                fill_rect(pm, x, y, bw, bh, &p);
+            }
+        };
+        edge(pm, (0.0, 0.0), (0.0, band), 0.0, 0.0, w, band);                 // top
+        edge(pm, (0.0, h), (0.0, h - band), 0.0, h - band, w, band);          // bottom
+        edge(pm, (0.0, 0.0), (band, 0.0), 0.0, 0.0, band, h);                 // left
+        edge(pm, (w, 0.0), (w - band, 0.0), w - band, 0.0, band, h);          // right
+
+        // Crisp bright rim at the very edge.
+        let rim = solid(rgba(color, a), BlendMode::Plus);
+        let rt = 3.0;
+        fill_rect(pm, 0.0, 0.0, w, rt, &rim);
+        fill_rect(pm, 0.0, h - rt, w, rt, &rim);
+        fill_rect(pm, 0.0, 0.0, rt, h, &rim);
+        fill_rect(pm, w - rt, 0.0, rt, h, &rim);
+    }
+
+    // ── Orchestra energy bars ───────────────────────────────────────────────
+    // Big edge bars whose extent = current orchestral loudness, colored by the
+    // dominant section, with a bloom on strong entrances. Vertical layout puts
+    // them on the left/right edges; horizontal layout uses top/bottom (the left
+    // edge is the keyboard there).
+    fn draw_orchestra_bars(&self, pm: &mut Pixmap, t: f64, active: &[u32]) {
+        let mut energy = 0.0f32;
+        let mut cr = 0.0f32; let mut cg = 0.0f32; let mut cb = 0.0f32;
+        let mut onset = 0.0f32;
+        for &ni in active {
+            let n = &self.notes[ni as usize];
+            if self.tracks[n.track].is_piano { continue; }
+            if t < n.start || t > n.end { continue; }
+            let c = self.tracks[n.track].color;
+            energy += n.vel;
+            cr += c[0] as f32 * n.vel; cg += c[1] as f32 * n.vel; cb += c[2] as f32 * n.vel;
+            let since = (t - n.start) as f32;
+            if since >= 0.0 && since < 0.08 { onset += n.vel; } // recent entrance
+        }
+        if energy <= 1e-4 { return; }
+        let frac = (energy / self.orch_norm).clamp(0.0, 1.0).powf(0.7);
+        let color = [
+            (cr / energy) as u8,
+            (cg / energy) as u8,
+            (cb / energy) as u8,
+        ];
+        let bloom = (onset / self.orch_norm).clamp(0.0, 1.0);
+
+        let w = self.width as f32;
+        let h = self.height as f32;
+        let thick = (w.min(h) * 0.045).max(16.0);
+
+        let draw_bar = |pm: &mut Pixmap, vertical: bool, near_edge: bool| {
+            // Bar grows from the screen edge; gradient bright at the edge.
+            if vertical {
+                let bw = thick;
+                let bh = frac * h;
+                let x = if near_edge { 0.0 } else { w - bw };
+                let y = h - bh;
+                let (g0, g1) = if near_edge { ((0.0, 0.0), (bw, 0.0)) } else { ((w, 0.0), (w - bw, 0.0)) };
+                if let Some(p) = linear_grad(g0, g1,
+                    vec![GradientStop::new(0.0, rgba(color, 0.85)), GradientStop::new(1.0, rgba(color, 0.05))],
+                    BlendMode::Plus) { fill_rect(pm, x, y, bw, bh, &p); }
+                // bright cap + entrance bloom at the leading end
+                fill_rect(pm, x, y, bw, 4.0, &solid(rgba(lighten(color, 0.6), 0.9), BlendMode::Plus));
+                if bloom > 0.02 { glow_disc(pm, x + bw / 2.0, y, thick * (2.0 + bloom * 3.0), lighten(color, 0.4), 0.5 * bloom); }
+            } else {
+                let bw = frac * w;
+                let bh = thick;
+                let y = if near_edge { 0.0 } else { h - bh };
+                let (g0, g1) = if near_edge { ((0.0, 0.0), (0.0, bh)) } else { ((0.0, h), (0.0, h - bh)) };
+                if let Some(p) = linear_grad(g0, g1,
+                    vec![GradientStop::new(0.0, rgba(color, 0.85)), GradientStop::new(1.0, rgba(color, 0.05))],
+                    BlendMode::Plus) { fill_rect(pm, 0.0, y, bw, bh, &p); }
+                fill_rect(pm, bw - 4.0, y, 4.0, bh, &solid(rgba(lighten(color, 0.6), 0.9), BlendMode::Plus));
+                if bloom > 0.02 { glow_disc(pm, bw, y + bh / 2.0, thick * (2.0 + bloom * 3.0), lighten(color, 0.4), 0.5 * bloom); }
+            }
+        };
+
+        if self.horizontal {
+            draw_bar(pm, false, true);  // top
+            draw_bar(pm, false, false); // bottom
+        } else {
+            draw_bar(pm, true, true);   // left
+            draw_bar(pm, true, false);  // right
+        }
+    }
+
+    // ── Tempo pendulum ──────────────────────────────────────────────────────
+    // A large metronome-style bob sweeping side to side, reaching an extreme
+    // (and flashing) exactly on each beat — a big motion cue for tempo.
+    fn draw_tempo_pendulum(&self, pm: &mut Pixmap, t: f64) {
+        if self.beats.len() < 2 { return; }
+        let beats = &self.beats;
+        let n = beats.len();
+        let i = beats.partition_point(|b| *b <= t);
+        let (b0, b1, idx) = if i == 0 {
+            (beats[0] - (beats[1] - beats[0]).max(0.2), beats[0], 0usize)
+        } else if i >= n {
+            (beats[n - 1], beats[n - 1] + (beats[n - 1] - beats[n - 2]).max(0.2), n - 1)
+        } else {
+            (beats[i - 1], beats[i], i - 1)
+        };
+        let p = (((t - b0) / (b1 - b0).max(1e-3)).clamp(0.0, 1.0)) as f32;
+        let pe = p * p * (3.0 - 2.0 * p); // smoothstep
+        // Alternate which side we sweep toward; s ∈ [-1,1], extreme on the beat.
+        let dir = if idx % 2 == 0 { 1.0f32 } else { -1.0 };
+        let s = dir * (2.0 * pe - 1.0);
+
+        let w = self.width as f32;
+        let h = self.height as f32;
+        // Baseline near the bottom of the note field (just above the keyboard in
+        // vertical mode; along the bottom edge in horizontal mode).
+        let base_y = if self.horizontal { h - h * 0.07 } else { self.hit - h * 0.05 };
+        let span = if self.horizontal { (w - self.kb_size) * 0.42 } else { w * 0.34 };
+        let center_x = if self.horizontal { self.kb_size + (w - self.kb_size) / 2.0 } else { w / 2.0 };
+        let sag = h * 0.05;
+        let bob_x = center_x + s * span;
+        let bob_y = base_y - sag * (s * s); // low at center, rising to the beats
+        let pivot = (center_x, base_y + h * 0.10);
+
+        let accent = [120, 200, 255]; // cool blue, distinct from the warm beat pulse
+
+        // Arm
+        let mut pb = PathBuilder::new();
+        pb.move_to(pivot.0, pivot.1);
+        pb.line_to(bob_x, bob_y);
+        if let Some(path) = pb.finish() {
+            let paint = solid(rgba(accent, 0.5), BlendMode::Plus);
+            let stroke = Stroke { width: 3.0, line_cap: LineCap::Round, ..Stroke::default() };
+            pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        }
+
+        // Bob with a beat flash as it nears an extreme (|s| → 1).
+        let r = (w.min(h) * 0.022).max(10.0);
+        let beatness = (s.abs() - 0.7).max(0.0) / 0.3; // 0..1 near the turnaround
+        glow_disc(pm, bob_x, bob_y, r * (2.4 + beatness * 1.6), accent, 0.45 + beatness * 0.4);
+        let mut pb = PathBuilder::new();
+        pb.push_circle(bob_x, bob_y, r);
+        if let Some(path) = pb.finish() {
+            pm.fill_path(&path, &solid(rgba(lighten(accent, 0.4), 0.95), BlendMode::Plus),
+                FillRule::Winding, Transform::identity(), None);
+        }
     }
 
     // ── Background ──────────────────────────────────────────────────────────

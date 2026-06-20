@@ -388,7 +388,6 @@ export default function WaveformEditor({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const lastAudioPosRef = useRef<number>(-1);
   const lastTimeUiRef = useRef<number>(0); // throttle clock for the time-readout re-render
-  const lastSeekRef = useRef<number>(0);   // throttle clock for cursor seek/auto-scroll
 
   // ── Spectrogram ────────────────────────────────────────────────────────────
   const specCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -416,6 +415,11 @@ export default function WaveformEditor({
   const specStretchVerRef = useRef(0); // bumped when the stretch mapping changes
   const specDataVerRef = useRef(0);    // bumped when spectrogram data is (re)loaded
   const scrollLeftRef = useRef(0);
+  // Our own playhead: a tiny element moved via transform. WaveSurfer's built-in
+  // cursor/progress mutated clipPath on the full-width waveform every frame,
+  // forcing a costly re-composite; a transform-only overlay is ~free.
+  const playheadRef = useRef<HTMLDivElement | null>(null);
+  const viewportWRef = useRef(0); // cached container width (avoid layout reads)
   const [showSpec, setShowSpec] = useState(() =>
     localStorage.getItem("beats_show_spec") !== "false"
   );
@@ -518,14 +522,22 @@ export default function WaveformEditor({
   useEffect(() => { currentTimeRef.current = currentTime; }, [currentTime]);
   useEffect(() => { playingRef.current = playing; }, [playing]);
 
-  // Update cursor colors when the selected timeline changes
+  // Playhead color follows the selected timeline.
   useEffect(() => {
     const mp3Color = selectedTimeline === 'mp3' ? '#44ff88' : '#ffdd44';
-    wsRef.current?.setOptions({ cursorColor: mp3Color });
-    bassWsRef.current?.setOptions({ cursorColor: mp3Color });
+    if (playheadRef.current) playheadRef.current.style.background = mp3Color;
     drawPianoRoll();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedTimeline]);
+
+  // Move the playhead overlay to the current position (transform only — cheap).
+  function updatePlayhead() {
+    const ph = playheadRef.current;
+    if (!ph) return;
+    const x = currentTimeRef.current * zoomPxPerSecRef.current - scrollLeftRef.current;
+    ph.style.transform = `translateX(${x}px)`;
+    ph.style.opacity = (x < -1 || x > viewportWRef.current + 1) ? '0' : '1';
+  }
 
   // ── WaveSurfer creation (display only — Rust drives audio) ────────────────
   useEffect(() => {
@@ -538,8 +550,7 @@ export default function WaveformEditor({
       container: containerRef.current,
       waveColor: "#5a4fcf",
       progressColor: "#9b8eff",
-      cursorColor: "#ffdd44",
-      cursorWidth: 2,
+      cursorWidth: 0, // we draw our own playhead (see playheadRef)
       height: containerRef.current.clientHeight || 128,
       normalize: true,
       // autoScroll off: WaveSurfer's scrollIntoView forced a layout reflow on
@@ -597,6 +608,7 @@ export default function WaveformEditor({
       if (beatsStripInnerRef.current) {
         beatsStripInnerRef.current.style.transform = `translateX(-${scrollLeft}px)`;
       }
+      updatePlayhead();
       scheduleDraw(); // batch canvas repaints to one per frame
       // Persist view state — debounced so we don't stringify+write every event.
       if (viewPersistTimerRef.current) clearTimeout(viewPersistTimerRef.current);
@@ -671,8 +683,7 @@ export default function WaveformEditor({
       container: bassContainerRef.current,
       waveColor: "rgba(251, 146, 60, 0.75)",
       progressColor: "rgba(251, 146, 60, 0.4)",
-      cursorColor: "#ffdd44",
-      cursorWidth: 2,
+      cursorWidth: 0, // shared playhead overlay instead
       height: bassContainerRef.current.clientHeight || 52,
       normalize: true,
       autoScroll: false,
@@ -726,11 +737,21 @@ export default function WaveformEditor({
     el.appendChild(canvas);
     specCanvasRef.current = canvas;
 
+    // Our own playhead (replaces WaveSurfer's cursor; moved via transform only).
+    const playhead = document.createElement('div');
+    playhead.style.cssText =
+      'position:absolute;top:0;left:0;width:2px;height:100%;background:#44ff88;'
+      + 'pointer-events:none;z-index:6;will-change:transform;';
+    el.appendChild(playhead);
+    playheadRef.current = playhead;
+
     const elNN = el; // capture non-null for closure
     function resize() {
       canvas.width = elNN.clientWidth;
       canvas.height = elNN.clientHeight;
+      viewportWRef.current = elNN.clientWidth;
       drawSpectrogram();
+      updatePlayhead();
     }
 
     const ro = new ResizeObserver(resize);
@@ -740,7 +761,9 @@ export default function WaveformEditor({
     return () => {
       ro.disconnect();
       canvas.remove();
+      playhead.remove();
       specCanvasRef.current = null;
+      playheadRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mp3Path]);
@@ -2018,31 +2041,20 @@ export default function WaveformEditor({
       }
       playingRef.current = p;
 
-      // Move the cursor via WaveSurfer.seekTo. autoScroll is off (it forced a
-      // per-frame reflow), so we page-flip the view ourselves only when the
-      // cursor nears the right edge. Throttled to ~30 Hz; always apply the final
-      // frame on pause so the cursor lands exactly.
-      const ws = wsRef.current;
-      const dur = durationRef.current;
-      if (ws && dur > 0 && (playChanged || now - lastSeekRef.current > 32)) {
-        lastSeekRef.current = now;
-        const pos = Math.max(0, Math.min(dispT / dur, 1));
-        ws.seekTo(pos);
-        bassWsRef.current?.seekTo(pos);
-
-        // Page-flip follow: when playing and the cursor passes ~85% of the
-        // viewport, jump it back near the left so a fresh page is visible ahead.
-        if (p) {
-          const scrollEl = ws.getWrapper().parentElement as HTMLElement | null;
-          if (scrollEl) {
-            const vw = scrollEl.clientWidth;
-            const cursorPx = dispT * zoomPxPerSecRef.current;
-            const rel = cursorPx - scrollEl.scrollLeft;
-            if (rel > vw * 0.85 || rel < 0) {
-              scrollEl.scrollLeft = Math.max(0, cursorPx - vw * 0.15);
-            }
-          }
-        }
+      // Move our own playhead (transform only — no WaveSurfer progress mutation,
+      // so the big waveform layer isn't re-composited each frame). Page-flip the
+      // view only when the playhead nears the edge, using cached width + our
+      // scrollLeft ref so we never force a layout read.
+      const cursorPx = dispT * zoomPxPerSecRef.current;
+      const vw = viewportWRef.current;
+      const rel = cursorPx - scrollLeftRef.current;
+      if (p && vw > 0 && (rel > vw * 0.85 || rel < 0)) {
+        const ws = wsRef.current;
+        const scrollEl = ws?.getWrapper().parentElement as HTMLElement | null;
+        if (scrollEl) scrollEl.scrollLeft = Math.max(0, cursorPx - vw * 0.15);
+        // the scroll event updates scrollLeftRef + redraws + repositions playhead
+      } else {
+        updatePlayhead();
       }
     });
     return () => { unlisten.then(fn => fn()); };
@@ -2300,11 +2312,20 @@ export default function WaveformEditor({
   // `t` is in display (stretched) time. WaveSurfer cursor uses it directly; the
   // engine expects original time, so convert at the boundary.
   function handleSeek(t: number) {
-    const ws = wsRef.current;
-    const dur = durationRef.current;
-    if (ws && dur > 0) {
-      ws.seekTo(Math.max(0, Math.min(t / dur, 1)));
+    // Move our playhead immediately (no WaveSurfer progress mutation) and tell
+    // the engine. `t` is display (stretched) time; engine wants original time.
+    currentTimeRef.current = t;
+    const vw = viewportWRef.current;
+    const cursorPx = t * zoomPxPerSecRef.current;
+    if (vw > 0) {
+      const rel = cursorPx - scrollLeftRef.current;
+      if (rel < 0 || rel > vw) {
+        const ws = wsRef.current;
+        const scrollEl = ws?.getWrapper().parentElement as HTMLElement | null;
+        if (scrollEl) scrollEl.scrollLeft = Math.max(0, cursorPx - vw * 0.15);
+      }
     }
+    updatePlayhead();
     invoke("seek_audio", { t: s2o(t) }).catch(console.error);
   }
 

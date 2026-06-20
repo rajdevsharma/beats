@@ -387,6 +387,7 @@ export default function WaveformEditor({
   const playBeatsRef = useRef(playBeats);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const lastAudioPosRef = useRef<number>(-1);
+  const lastTimeUiRef = useRef<number>(0); // throttle clock for the time-readout re-render
 
   // ── Spectrogram ────────────────────────────────────────────────────────────
   const specCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -398,6 +399,12 @@ export default function WaveformEditor({
   const specColsPerSecRef = useRef(0);
   const specMidiLoRef = useRef(21);
   const specMidiHiRef = useRef(108);
+  // Spectrogram render caches: a 256-entry color LUT (rebuilt only when the
+  // dials change) and a reused ImageData buffer, so the per-frame draw avoids
+  // a Math.pow per pixel and a ~1 MB allocation each frame.
+  const specLutRef = useRef<Uint8ClampedArray>(new Uint8ClampedArray(256 * 4));
+  const specLutKeyRef = useRef<string>("");
+  const specImageDataRef = useRef<ImageData | null>(null);
   const scrollLeftRef = useRef(0);
   const [showSpec, setShowSpec] = useState(() =>
     localStorage.getItem("beats_show_spec") !== "false"
@@ -1012,13 +1019,33 @@ export default function WaveformEditor({
     const viewHi = Math.min(midiHi, ctrl.hi);
     if (viewHi <= viewLo) return;
 
-    // dB reconstruction: stored u8 0..255 ↔ −90..0 dB (DB_FLOOR..DB_CEIL).
-    const DB_FLOOR = -90, DB_CEIL = 0, DB_RANGE = DB_CEIL - DB_FLOOR;
-    const floor = ctrl.floor, span = Math.max(1, DB_CEIL - floor);
-    const gain = ctrl.gain, invGamma = ctrl.gamma;
+    // Build the dial→color lookup table only when the dials change. It maps a
+    // stored u8 (−90..0 dB) through gain/floor/contrast to RGBA, so the pixel
+    // loop is a table read instead of pow()/log() per pixel.
+    const lutKey = `${ctrl.gain}|${ctrl.floor}|${ctrl.gamma}`;
+    if (specLutKeyRef.current !== lutKey) {
+      const DB_FLOOR = -90, DB_CEIL = 0, DB_RANGE = DB_CEIL - DB_FLOOR;
+      const floor = ctrl.floor, span = Math.max(1, DB_CEIL - floor);
+      const gain = ctrl.gain, invGamma = ctrl.gamma;
+      const lut = specLutRef.current;
+      for (let u = 0; u < 256; u++) {
+        const db = DB_FLOOR + (u / 255) * DB_RANGE + gain;
+        let tnorm = (db - floor) / span;
+        const o = u * 4;
+        if (tnorm <= 0) { lut[o] = lut[o + 1] = lut[o + 2] = lut[o + 3] = 0; continue; }
+        if (tnorm > 1) tnorm = 1;
+        const v = Math.pow(tnorm, invGamma);
+        const pi3 = ((v * 255) | 0) * 3;
+        lut[o]     = INFERNO[pi3];
+        lut[o + 1] = INFERNO[pi3 + 1];
+        lut[o + 2] = INFERNO[pi3 + 2];
+        lut[o + 3] = 30 + v * 225;
+      }
+      specLutKeyRef.current = lutKey;
+    }
+    const lut = specLutRef.current;
 
-    // Precompute, per output row, the fractional bin and interpolation tap —
-    // identical for every column, so this loop runs once not width×height.
+    // Per output row: fractional bin + interpolation tap (constant across x).
     const b0 = new Int32Array(height);
     const b1 = new Int32Array(height);
     const bf = new Float32Array(height);
@@ -1032,31 +1059,31 @@ export default function WaveformEditor({
       bf[y] = fb - lo;
     }
 
-    const imageData = ctx.createImageData(width, height);
+    // Reuse the ImageData buffer across frames (re-create only on resize).
+    let imageData = specImageDataRef.current;
+    if (!imageData || imageData.width !== width || imageData.height !== height) {
+      imageData = ctx.createImageData(width, height);
+      specImageDataRef.current = imageData;
+    }
     const data = imageData.data;
 
     for (let x = 0; x < width; x++) {
       // Display x is stretched time; spectrogram columns are in original time.
       const t = s2o((scrollLeft + x) / pxPerSec);
       const col = Math.floor(t * colsPerSec);
-      if (col < 0 || col >= cols) continue;
+      const valid = col >= 0 && col < cols;
       const colBase = col * bins;
 
       for (let y = 0; y < height; y++) {
-        // Vertically interpolate between adjacent pitch bins for smooth zoom.
-        const u8 = specData[colBase + b0[y]] * (1 - bf[y]) + specData[colBase + b1[y]] * bf[y];
-        let db = DB_FLOOR + (u8 / 255) * DB_RANGE + gain;
-        let tnorm = (db - floor) / span;
-        if (tnorm <= 0) continue; // below the floor → fully transparent
-        if (tnorm > 1) tnorm = 1;
-        const v = Math.pow(tnorm, invGamma);
-        const ci = (v * 255) | 0;
-        const pi3 = ci * 3;
         const idx = (y * width + x) * 4;
-        data[idx]     = INFERNO[pi3];
-        data[idx + 1] = INFERNO[pi3 + 1];
-        data[idx + 2] = INFERNO[pi3 + 2];
-        data[idx + 3] = Math.round(30 + v * 225);
+        if (!valid) { data[idx + 3] = 0; continue; } // clear stale pixel
+        // Vertically interpolate between adjacent pitch bins, then LUT.
+        const u8 = (specData[colBase + b0[y]] * (1 - bf[y]) + specData[colBase + b1[y]] * bf[y] + 0.5) | 0;
+        const o = u8 * 4;
+        data[idx]     = lut[o];
+        data[idx + 1] = lut[o + 1];
+        data[idx + 2] = lut[o + 2];
+        data[idx + 3] = lut[o + 3];
       }
     }
 
@@ -1212,6 +1239,21 @@ export default function WaveformEditor({
     const solo        = soloTrackIndexRef.current;
 
     const dispNotes = midiDispNotesRef.current;
+    // Visible note index window via binary search on t0 (notes are sorted by
+    // time and the display mapping is monotonic). LOOKBACK admits long sustained
+    // notes whose onset is left of the viewport but which still overlap it.
+    const NOTE_LOOKBACK = 16;
+    function noteWindow(disp: Float64Array): [number, number] {
+      const n = disp.length >> 1;
+      let lo = 0, hi = n;            // first index with t0 > tEnd
+      while (lo < hi) { const m = (lo + hi) >> 1; if (disp[2 * m] > tEnd) hi = m; else lo = m + 1; }
+      const end = lo;
+      const target = tStart - NOTE_LOOKBACK;
+      lo = 0; hi = end;             // first index with t0 >= target
+      while (lo < hi) { const m = (lo + hi) >> 1; if (disp[2 * m] < target) lo = m + 1; else hi = m; }
+      return [lo, end];
+    }
+
     const ctx2 = ctx;
     function drawTrackNotes(ti: number, color: string) {
       const st  = stats[ti];
@@ -1222,7 +1264,8 @@ export default function WaveformEditor({
       const notes = tracks[ti].notes;
       const disp = dispNotes[ti];
       if (!disp) return;
-      for (let i = 0; i < notes.length; i++) {
+      const [wStart, wEnd] = noteWindow(disp);
+      for (let i = wStart; i < wEnd; i++) {
         const t0 = disp[2 * i];
         const t1 = disp[2 * i + 1];
         if (t1 < tStart || t0 > tEnd) continue;
@@ -1274,7 +1317,8 @@ export default function WaveformEditor({
         const notes = tracks[ti].notes;
         const disp = dispNotes[ti];
         if (!disp) continue;
-        for (let i = 0; i < notes.length; i++) {
+        const [wStart, wEnd] = noteWindow(disp);
+        for (let i = wStart; i < wEnd; i++) {
           const t0 = disp[2 * i];
           if (t0 < tStart || t0 > tEnd) continue;
           const note = notes[i];
@@ -1910,9 +1954,18 @@ export default function WaveformEditor({
       lastAudioPosRef.current = t;
 
       const dispT = o2s(t);
-      setCurrentTime(dispT);
       currentTimeRef.current = dispT;
-      setPlaying(p);
+
+      // The cursor itself is moved directly on WaveSurfer below (smooth, no
+      // React). The time-readout React state is throttled to ~12 Hz so we don't
+      // re-render this large component on every position event.
+      const now = performance.now();
+      const playChanged = p !== playingRef.current;
+      if (playChanged || now - lastTimeUiRef.current > 80) {
+        lastTimeUiRef.current = now;
+        setCurrentTime(dispT);
+        setPlaying(p);
+      }
       playingRef.current = p;
 
       const ws = wsRef.current;

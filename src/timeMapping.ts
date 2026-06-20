@@ -61,10 +61,13 @@ export function stretchedDuration(totalDuration: number, stretches: Stretch[]): 
   );
 }
 
-/** Map a time position in the original audio to its position in the stretched audio. */
+/** Map a time position in the original audio to its position in the stretched audio.
+ *  NOTE: callers in hot paths must pass an already-sorted `stretches` array
+ *  (sorted by `start`); this function does not sort, to avoid per-call allocation. */
 export function originalToStretched(t: number, stretches: Stretch[]): number {
+  if (stretches.length === 0) return t; // fast path: no stretches → identity
   let offset = 0;
-  for (const s of [...stretches].sort((a, b) => a.start - b.start)) {
+  for (const s of stretches) {
     if (t <= s.start) break;
     if (t <= s.end) {
       return s.start + (t - s.start) * s.factor + offset;

@@ -431,6 +431,13 @@ export default function WaveformEditor({
   const gridLockCacheRef   = useRef<{ key: string; scores: number[] } | null>(null);
   const rollOptionsRef     = useRef<RollOptions>(DEFAULT_ROLL_OPTIONS);
   const midiRangeRef       = useRef({ min: 21, max: 108 });
+  const drawRafRef         = useRef<number | null>(null); // coalesces canvas redraws
+  const viewPersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Precomputed display (stretched) positions, so the per-frame piano-roll draw
+  // does no warp/stretch math. Per track: [t0,t1, t0,t1, …]; rebuilt only when
+  // beats / midiBeats / stretches / the MIDI itself change.
+  const midiDispNotesRef   = useRef<Float64Array[]>([]);
+  const midiDispBeatsRef   = useRef<Float64Array>(new Float64Array(0));
 
   // ── MIDI playback engine ───────────────────────────────────────────────────
   const midiAudioCtxRef    = useRef<AudioContext & { masterOut?: AudioNode } | null>(null);
@@ -472,15 +479,19 @@ export default function WaveformEditor({
   }, [midiVolume]);
 
   // Keep refs in sync
-  useEffect(() => { beatsRef.current = beats; drawPianoRoll(); }, [beats]);
+  useEffect(() => { beatsRef.current = beats; rebuildMidiDispCache(); drawPianoRoll(); }, [beats]);
   useEffect(() => {
-    stretchesRef.current = stretches;
-    segmentsRef.current = buildSegments(origDurationRef.current, stretches);
+    // Keep the ref sorted by start: originalToStretched (a hot-path helper) now
+    // assumes sorted input to avoid per-call allocation.
+    const sorted = [...stretches].sort((a, b) => a.start - b.start);
+    stretchesRef.current = sorted;
+    segmentsRef.current = buildSegments(origDurationRef.current, sorted);
+    rebuildMidiDispCache();
   }, [stretches]);
   useEffect(() => { onBeatsChangeRef.current = onBeatsChange; }, [onBeatsChange]);
   useEffect(() => { onStretchesChangeRef.current = onStretchesChange; }, [onStretchesChange]);
   useEffect(() => { onMidiBeatsChangeRef.current = onMidiBeatsChange; }, [onMidiBeatsChange]);
-  useEffect(() => { midiBeatsRef.current = midiBeats; drawPianoRoll(); }, [midiBeats]);
+  useEffect(() => { midiBeatsRef.current = midiBeats; rebuildMidiDispCache(); drawPianoRoll(); }, [midiBeats]);
   useEffect(() => { soloTrackIndexRef.current = soloTrackIndex; drawPianoRoll(); }, [soloTrackIndex]);
   useEffect(() => { rollOptionsRef.current = rollOptions; drawPianoRoll(); }, [rollOptions]);
   useEffect(() => { selectedBeatTimeRef.current = selectedBeatTime; }, [selectedBeatTime]);
@@ -560,18 +571,21 @@ export default function WaveformEditor({
 
     ws.on("scroll", (_s: number, _e: number, scrollLeft: number) => {
       scrollLeftRef.current = scrollLeft;
-      drawSpectrogram();
-      drawPianoRoll();
+      // Transform is cheap and must track the cursor tightly → keep synchronous.
       if (beatsStripInnerRef.current) {
         beatsStripInnerRef.current.style.transform = `translateX(-${scrollLeft}px)`;
       }
-      // Persist view state (debounced via the zoom timer slot)
-      const fit = fitPxPerSecRef.current;
-      if (fit) {
-        const multiplier = zoomPxPerSecRef.current / fit;
-        const scrollT = scrollLeft / zoomPxPerSecRef.current;
-        localStorage.setItem(`beats_view_${mp3Path}`, JSON.stringify({ multiplier, scrollTime: scrollT }));
-      }
+      scheduleDraw(); // batch canvas repaints to one per frame
+      // Persist view state — debounced so we don't stringify+write every event.
+      if (viewPersistTimerRef.current) clearTimeout(viewPersistTimerRef.current);
+      viewPersistTimerRef.current = setTimeout(() => {
+        const fit = fitPxPerSecRef.current;
+        if (fit) {
+          const multiplier = zoomPxPerSecRef.current / fit;
+          const scrollT = scrollLeftRef.current / zoomPxPerSecRef.current;
+          localStorage.setItem(`beats_view_${mp3Path}`, JSON.stringify({ multiplier, scrollTime: scrollT }));
+        }
+      }, 250);
     });
 
     ws.on("interaction", (t: number) => {
@@ -784,6 +798,7 @@ export default function WaveformEditor({
             .map(bt => Math.abs(bt - hitBeat) < 0.001 ? liveMidiT : bt)
             .sort((a, b) => a - b);
           selectedMidiBeatRef.current = liveMidiT;
+          rebuildMidiDispCache(); // warp changed → refresh cached note positions
           drawPianoRoll();
         }
 
@@ -939,6 +954,7 @@ export default function WaveformEditor({
         setMidiCursorDisp(0);
         setSoloTrackIndex(null);
         setMidiLegend(tracks.map((t, i) => ({ name: t.name, color: colors[i] })));
+        rebuildMidiDispCache();
         drawPianoRoll();
         drawPianoKeyboard();
 
@@ -1089,6 +1105,38 @@ export default function WaveformEditor({
     return null;
   }
 
+  // Recompute cached display positions for every MIDI note + beat. Only the
+  // warp (beats) and stretch mapping change these, never zoom/scroll/playback,
+  // so we do it here instead of per-note per-frame in drawPianoRoll.
+  function rebuildMidiDispCache() {
+    const tracks = midiTracksRef.current;
+    midiDispNotesRef.current = tracks.map(t => {
+      const arr = new Float64Array(t.notes.length * 2);
+      for (let i = 0; i < t.notes.length; i++) {
+        const n = t.notes[i];
+        arr[2 * i]     = midiToDisp(n.time);
+        arr[2 * i + 1] = midiToDisp(n.time + n.dur);
+      }
+      return arr;
+    });
+    const mb = midiBeatsRef.current;
+    const beats = new Float64Array(mb.length);
+    for (let i = 0; i < mb.length; i++) beats[i] = midiToDisp(mb[i]);
+    midiDispBeatsRef.current = beats;
+  }
+
+  // Coalesce spectrogram + piano-roll redraws to at most one per animation
+  // frame. WaveSurfer fires many scroll events per frame during playback;
+  // without this each one triggered two full canvas repaints.
+  function scheduleDraw() {
+    if (drawRafRef.current != null) return;
+    drawRafRef.current = requestAnimationFrame(() => {
+      drawRafRef.current = null;
+      drawSpectrogram();
+      drawPianoRoll();
+    });
+  }
+
   // ── Piano Roll draw ────────────────────────────────────────────────────────
   function drawPianoRoll() {
     const canvas = pianoRollCanvasRef.current;
@@ -1163,6 +1211,7 @@ export default function WaveformEditor({
     const stats       = midiTrackStatsRef.current;
     const solo        = soloTrackIndexRef.current;
 
+    const dispNotes = midiDispNotesRef.current;
     const ctx2 = ctx;
     function drawTrackNotes(ti: number, color: string) {
       const st  = stats[ti];
@@ -1170,10 +1219,14 @@ export default function WaveformEditor({
       const glScore  = gridLockScores[ti] ?? 0;
       const glBoost  = opts.gridLock ? 0.3 + glScore * 1.4 : 1.0;
 
-      for (const note of tracks[ti].notes) {
-        const t0 = midiToDisp(note.time);
-        const t1 = midiToDisp(note.time + note.dur);
+      const notes = tracks[ti].notes;
+      const disp = dispNotes[ti];
+      if (!disp) return;
+      for (let i = 0; i < notes.length; i++) {
+        const t0 = disp[2 * i];
+        const t1 = disp[2 * i + 1];
         if (t1 < tStart || t0 > tEnd) continue;
+        const note = notes[i];
         const durAudio = t1 - t0;
         const x = t0 * pxPerSec - scrollLeft;
         const w = Math.max(2, (t1 - t0) * pxPerSec - 1);
@@ -1218,9 +1271,13 @@ export default function WaveformEditor({
       for (let ti = 0; ti < tracks.length; ti++) {
         if (solo !== null && ti !== solo) continue;
         const fc = tracks[ti].isPiano ? '#ffffff' : (trackColors[ti] ?? '#fff');
-        for (const note of tracks[ti].notes) {
-          const t0 = midiToDisp(note.time);
+        const notes = tracks[ti].notes;
+        const disp = dispNotes[ti];
+        if (!disp) continue;
+        for (let i = 0; i < notes.length; i++) {
+          const t0 = disp[2 * i];
           if (t0 < tStart || t0 > tEnd) continue;
+          const note = notes[i];
           const x = t0 * pxPerSec - scrollLeft;
           ctx.globalAlpha = 0.5 + note.vel * 0.5;
           ctx.fillStyle   = fc;
@@ -1234,9 +1291,10 @@ export default function WaveformEditor({
 
     // MIDI beat markers
     const selBeat = selectedMidiBeatRef.current;
-    for (const bt of mb) {
-      const t = midiToDisp(bt);
-      const x = t * pxPerSec - scrollLeft;
+    const dispBeats = midiDispBeatsRef.current;
+    for (let bi = 0; bi < mb.length; bi++) {
+      const bt = mb[bi];
+      const x = (dispBeats[bi] ?? midiToDisp(bt)) * pxPerSec - scrollLeft;
       if (x < -4 || x > width + 4) continue;
       const isSel = selBeat !== null && Math.abs(bt - selBeat) < 0.001;
 

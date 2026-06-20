@@ -1571,23 +1571,31 @@ export default function WaveformEditor({
     const already      = midiScheduledToRef.current;
     if (scheduleUpto <= already) return;
     const solo = soloTrackIndexRef.current;
-    for (let ti = 0; ti < midiTracksRef.current.length; ti++) {
+    const tracks = midiTracksRef.current;
+    const dispNotes = midiDispNotesRef.current; // precomputed display t0/t1, sorted by t0
+    for (let ti = 0; ti < tracks.length; ti++) {
       if (solo !== null && ti !== solo) continue;
-      for (const note of midiTracksRef.current[ti].notes) {
-        // Schedule on the display (stretched) axis so MIDI follows stretches
-        // and stays locked to the stretched audio during play-both.
-        const noteAudioStart = midiToDisp(note.time);
-        const noteAudioEnd   = midiToDisp(note.time + note.dur);
-        if (noteAudioEnd < already) continue;
-        if (noteAudioStart >= scheduleUpto) break; // warp is monotone so break is safe
-        if (noteAudioStart < already) continue;
+      const disp = dispNotes[ti];
+      const notes = tracks[ti].notes;
+      if (!disp) continue;
+      // Binary-search the first note whose onset is at/after the already-
+      // scheduled point, so each tick only touches the small [already,
+      // scheduleUpto) window — not every note from the start of the piece.
+      const n = disp.length >> 1;
+      let lo = 0, hi = n;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (disp[2 * m] < already) lo = m + 1; else hi = m; }
+      for (let i = lo; i < n; i++) {
+        const noteAudioStart = disp[2 * i];
+        if (noteAudioStart >= scheduleUpto) break; // sorted by t0 → safe
+        const noteAudioEnd = disp[2 * i + 1];
         const wallStart = midiStartWallRef.current + (noteAudioStart - midiStartAudioRef.current);
         if (wallStart < ctx.currentTime - 0.01) continue;
+        const note = notes[i];
         const noteDur = Math.max(0.05, noteAudioEnd - noteAudioStart);
         let stop: (now: number) => void;
-        if (midiTracksRef.current[ti].isPiano && globalPianoSampler?.isReady) {
+        if (tracks[ti].isPiano && globalPianoSampler?.isReady) {
           stop = globalPianoSampler.scheduleNote(ctx, out, note.pitch, note.vel, wallStart, noteDur);
-        } else if (midiTracksRef.current[ti].isPiano) {
+        } else if (tracks[ti].isPiano) {
           schedulePianoNote(ctx, out, note.pitch, note.vel, wallStart, noteDur);
           continue; // schedulePianoNote pushes its own entry
         } else {

@@ -441,6 +441,11 @@ export default function WaveformEditor({
 
   // ── Piano Roll state ───────────────────────────────────────────────────────
   const [midiLegend, setMidiLegend] = useState<{ name: string; color: string }[]>([]);
+  // Which tracks have notes within the current zoom/scroll window (for graying
+  // out absent instruments in the legend). Updated from drawPianoRoll only when
+  // the set actually changes, to avoid per-frame re-renders.
+  const [tracksInView, setTracksInView] = useState<boolean[]>([]);
+  const tracksInViewRef = useRef<boolean[]>([]);
   const [soloTrackIndex, setSoloTrackIndex] = useState<number | null>(null);
   const soloTrackIndexRef = useRef<number | null>(null);
   const [rollOptions, setRollOptions] = useState<RollOptions>(DEFAULT_ROLL_OPTIONS);
@@ -1316,6 +1321,24 @@ export default function WaveformEditor({
       lo = 0; hi = end;             // first index with t0 >= target
       while (lo < hi) { const m = (lo + hi) >> 1; if (disp[2 * m] < target) lo = m + 1; else hi = m; }
       return [lo, end];
+    }
+
+    // Which tracks have at least one note overlapping the visible window — drives
+    // legend graying. Only push to React state when the set changes.
+    {
+      const inView = new Array(tracks.length).fill(false);
+      for (let ti = 0; ti < tracks.length; ti++) {
+        const disp = dispNotes[ti];
+        if (!disp) continue;
+        const [s, e] = noteWindow(disp);
+        for (let i = s; i < e; i++) {
+          if (disp[2 * i + 1] >= tStart && disp[2 * i] <= tEnd) { inView[ti] = true; break; }
+        }
+      }
+      const prev = tracksInViewRef.current;
+      let changed = prev.length !== inView.length;
+      if (!changed) for (let i = 0; i < inView.length; i++) if (prev[i] !== inView[i]) { changed = true; break; }
+      if (changed) { tracksInViewRef.current = inView; setTracksInView(inView); }
     }
 
     const ctx2 = ctx;
@@ -3058,6 +3081,8 @@ export default function WaveformEditor({
               const isSolo  = soloTrackIndex === i;
               const dimmed  = soloTrackIndex !== null && !isSolo;
               const st      = midiTrackStatsRef.current[i];
+              // Gray the name when this instrument has no notes in the current view.
+              const inView  = tracksInView[i] ?? true;
               return (
                 <span
                   key={i}
@@ -3065,8 +3090,8 @@ export default function WaveformEditor({
                   onClick={() => setSoloTrackIndex(isSolo ? null : i)}
                   style={{ cursor: 'pointer', opacity: dimmed ? 0.3 : 1, outline: isSolo ? `1px solid ${t.color}` : 'none', borderRadius: 3, padding: '1px 3px', flexDirection: 'column', alignItems: 'flex-start', gap: 2 }}
                 >
-                  <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                    <span className="piano-roll-legend-dot" style={{ background: t.color }} />
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 4, color: inView ? undefined : 'var(--text-muted)' }}>
+                    <span className="piano-roll-legend-dot" style={{ background: t.color, opacity: inView ? 1 : 0.35 }} />
                     {t.name}
                   </span>
                   {st && (rollOptions.ioiRegularity || rollOptions.gridLock) && (

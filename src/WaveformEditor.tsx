@@ -388,6 +388,7 @@ export default function WaveformEditor({
   const audioCtxRef = useRef<AudioContext | null>(null);
   const lastAudioPosRef = useRef<number>(-1);
   const lastTimeUiRef = useRef<number>(0); // throttle clock for the time-readout re-render
+  const lastSeekRef = useRef<number>(0);   // throttle clock for cursor seek/auto-scroll
 
   // ── Spectrogram ────────────────────────────────────────────────────────────
   const specCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1976,9 +1977,14 @@ export default function WaveformEditor({
       }
       playingRef.current = p;
 
+      // Move the cursor (WaveSurfer.seekTo → its auto-center scrollIntoView,
+      // which forces a layout reflow + waveform re-render). The engine emits at
+      // ~60 Hz; a 30 Hz cursor looks smooth and halves that reflow cost. Always
+      // apply the final frame on pause so the cursor lands exactly.
       const ws = wsRef.current;
       const dur = durationRef.current;
-      if (ws && dur > 0) {
+      if (ws && dur > 0 && (playChanged || now - lastSeekRef.current > 32)) {
+        lastSeekRef.current = now;
         const pos = Math.max(0, Math.min(dispT / dur, 1));
         ws.seekTo(pos);
         bassWsRef.current?.seekTo(pos);

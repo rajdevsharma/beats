@@ -38,7 +38,13 @@ pub struct VideoOptions {
     pub orchestra_bars: bool,
     #[serde(default)]
     pub tempo_pendulum: bool,
+    /// Playback speed as a fraction (1.0 = normal, 0.8 = 80% for slow practice).
+    /// Audio is time-stretched (pitch-preserved) and the visuals slowed to match.
+    #[serde(default = "default_speed")]
+    pub speed: f64,
 }
+
+fn default_speed() -> f64 { 1.0 }
 
 #[derive(Serialize, Clone)]
 struct VideoProgress {
@@ -104,7 +110,17 @@ pub async fn export_video(
         let f0 = ((clip_start * sr as f64) as usize).min(out_total);
         let f1 = ((clip_end * sr as f64) as usize).min(out_total);
         let tmp_wav = format!("{}.tmp_video.wav", output_path);
-        write_wav(&samples[f0 * ch..f1 * ch], ch, sr, &tmp_wav)?;
+        // Practice speed: time-stretch the clip (pitch-preserving) so the audio
+        // plays slower/faster; the visuals are slowed to match below.
+        let speed = options.speed.clamp(0.25, 4.0);
+        if (speed - 1.0).abs() > 1e-6 {
+            let stretched = crate::audio::rubberband::stretch_offline(
+                &samples[f0 * ch..f1 * ch], ch, sr, 1.0 / speed,
+            );
+            write_wav(&stretched, ch, sr, &tmp_wav)?;
+        } else {
+            write_wav(&samples[f0 * ch..f1 * ch], ch, sr, &tmp_wav)?;
+        }
         drop(samples);
 
         // ── Stage 4: build scene ───────────────────────────────────────────
@@ -146,7 +162,9 @@ pub async fn export_video(
         // ── Stage 5: render frames → ffmpeg (40–100 %) ─────────────────────
         emit(40, "Rendering video");
         let fps = options.fps.max(1);
-        let frame_count = (clip_dur * fps as f64).ceil() as u64;
+        // At speed s the video lasts clip_dur/s; frame i shows content time
+        // (i/fps)*s, so the visuals slow in lock-step with the stretched audio.
+        let frame_count = (clip_dur / speed * fps as f64).ceil() as u64;
         let size_arg = format!("{}x{}", options.width, options.height);
         let fps_arg = fps.to_string();
 
@@ -205,7 +223,7 @@ pub async fn export_video(
             let chunk_end = (chunk_start + CHUNK).min(frame_count);
             let frames: Vec<Vec<u8>> = (chunk_start..chunk_end)
                 .into_par_iter()
-                .map(|i| scene.render_frame(i as f64 / fps as f64))
+                .map(|i| scene.render_frame(i as f64 / fps as f64 * speed))
                 .collect();
             for f in &frames {
                 if let Err(e) = stdin.write_all(f) {

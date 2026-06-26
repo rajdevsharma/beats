@@ -4,6 +4,7 @@ export interface VideoExportOpts {
   orientation: "vertical" | "horizontal";
   start: number;
   end: number;
+  speed: number; // fraction: 1 = normal, 0.8 = 80% for slow practice
   beatPulse: boolean;
   orchestraBars: boolean;
   tempoPendulum: boolean;
@@ -42,6 +43,7 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
   const [orientation, setOrientation] = useState<"vertical" | "horizontal">("vertical");
   const [startStr, setStartStr] = useState("0:00");
   const [endStr, setEndStr] = useState(formatTime(totalDuration));
+  const [speedStr, setSpeedStr] = useState("100");
   const [cues, setCues] = useState<Record<string, boolean>>(() => {
     try {
       const raw = localStorage.getItem("beats_video_cues");
@@ -52,15 +54,19 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
 
   const start = parseTime(startStr);
   const end = parseTime(endStr);
+  const speedPct = parseFloat(speedStr);
+  const speedValid = isFinite(speedPct) && speedPct >= 25 && speedPct <= 400;
   const valid =
     start !== null && end !== null &&
-    start >= 0 && end > start && start < totalDuration;
+    start >= 0 && end > start && start < totalDuration && speedValid;
   const clipDur = valid ? Math.min(end!, totalDuration) - start! : null;
+  const videoLen = clipDur !== null ? clipDur / (speedPct / 100) : null;
 
   function handleConfirm() {
     if (!valid) return;
     localStorage.setItem("beats_video_cues", JSON.stringify(cues));
     onConfirm({
+      speed: speedPct / 100,
       orientation, start: start!, end: Math.min(end!, totalDuration),
       beatPulse: !!cues.beatPulse,
       orchestraBars: !!cues.orchestraBars,
@@ -129,6 +135,26 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
             Times are in the exported (stretched) timeline · full piece = {formatTime(totalDuration)}
           </p>
 
+          <div className="modal-row modal-row-input">
+            <label className="modal-label" htmlFor="video-speed">Speed</label>
+            <div className="modal-input-group">
+              <input
+                id="video-speed"
+                className="modal-input"
+                type="number"
+                min="25"
+                max="400"
+                step="5"
+                value={speedStr}
+                onChange={(e) => setSpeedStr(e.target.value)}
+              />
+              <span className="modal-input-unit">%</span>
+            </div>
+          </div>
+          <p className="modal-hint">
+            &lt;100% = slower for practice (pitch preserved) &nbsp;·&nbsp; &gt;100% = faster
+          </p>
+
           <div className="modal-divider" />
 
           <div className="modal-row">
@@ -148,11 +174,13 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
             ))}
           </div>
 
-          {clipDur !== null && (
+          {videoLen !== null && (
             <div className="modal-preview">
               <div className="modal-row">
                 <span className="modal-label">Video length</span>
-                <span className="modal-value mono">{formatTime(clipDur)}</span>
+                <span className="modal-value mono">
+                  {formatTime(videoLen)}{speedPct !== 100 ? ` · ${speedPct}% speed` : ""}
+                </span>
               </div>
               <div className="modal-row">
                 <span className="modal-label">Format</span>

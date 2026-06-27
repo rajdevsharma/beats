@@ -1,16 +1,25 @@
 import { useState } from "react";
 
-export interface VideoExportOpts {
+type CueKey =
+  | "beatPulse" | "orchestraBars" | "tempoPendulum"
+  | "progressBar" | "nextNoteCue" | "countdownPips";
+
+export interface VideoExportOpts extends Record<CueKey, boolean> {
   orientation: "vertical" | "horizontal";
   start: number;
   end: number;
   speed: number; // fraction: 1 = normal, 0.8 = 80% for slow practice
-  beatPulse: boolean;
-  orchestraBars: boolean;
-  tempoPendulum: boolean;
 }
 
-const CUES: { key: "beatPulse" | "orchestraBars" | "tempoPendulum"; label: string; desc: string }[] = [
+const CUE_DEFAULTS: Record<CueKey, boolean> = {
+  beatPulse: true, orchestraBars: true, tempoPendulum: false,
+  progressBar: true, nextNoteCue: true, countdownPips: true,
+};
+
+const CUES: { key: CueKey; label: string; desc: string }[] = [
+  { key: "progressBar", label: "Progress bar", desc: "Bar across the top tracking your position through the piece — where am I overall" },
+  { key: "nextNoteCue", label: "Next-note cue", desc: "Rings the immediate upcoming piano note(s) with a guide line so you always see what you play next" },
+  { key: "countdownPips", label: "Re-entry countdown", desc: "During a piano rest, pips count the beats until your next entrance so you come back in on time" },
   { key: "beatPulse", label: "Beat pulse", desc: "Full-screen edge glow that swells into every beat — easy to catch in peripheral vision" },
   { key: "orchestraBars", label: "Orchestra energy bars", desc: "Big edge bars showing how loud the orchestra is, colored by section, flashing on entrances" },
   { key: "tempoPendulum", label: "Tempo pendulum", desc: "Large metronome bob sweeping side to side, hitting an extreme on each beat" },
@@ -47,9 +56,10 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
   const [cues, setCues] = useState<Record<string, boolean>>(() => {
     try {
       const raw = localStorage.getItem("beats_video_cues");
-      if (raw) return JSON.parse(raw);
+      // Merge over defaults so newly-added cues appear for returning users.
+      if (raw) return { ...CUE_DEFAULTS, ...JSON.parse(raw) };
     } catch { /* ignore */ }
-    return { beatPulse: true, orchestraBars: true, tempoPendulum: false };
+    return { ...CUE_DEFAULTS };
   });
 
   const start = parseTime(startStr);
@@ -71,6 +81,9 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
       beatPulse: !!cues.beatPulse,
       orchestraBars: !!cues.orchestraBars,
       tempoPendulum: !!cues.tempoPendulum,
+      progressBar: !!cues.progressBar,
+      nextNoteCue: !!cues.nextNoteCue,
+      countdownPips: !!cues.countdownPips,
     });
   }
 

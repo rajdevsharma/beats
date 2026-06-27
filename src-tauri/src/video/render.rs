@@ -42,6 +42,12 @@ pub struct Scene {
     orchestra_bars: bool,
     tempo_pendulum: bool,
     orch_norm: f32, // normalizer for orchestral concurrent-energy → [0,1]
+    // Orientation cues (independently toggleable)
+    progress_bar: bool,
+    next_note_cue: bool,
+    countdown_pips: bool,
+    clip_dur: f64,             // total clip length, for the progress bar
+    piano_onsets: Vec<f64>,    // sorted distinct piano onset times (for cues)
 }
 
 const PARTICLE_MAX_LIFE: f64 = 0.85;
@@ -249,6 +255,9 @@ impl Scene {
         beat_pulse: bool,
         orchestra_bars: bool,
         tempo_pendulum: bool,
+        progress_bar: bool,
+        next_note_cue: bool,
+        countdown_pips: bool,
     ) -> Scene {
         let (kb_size, hit, key_extent, lookahead) = if horizontal {
             let kb = (width as f32 * 0.085).clamp(110.0, 220.0);
@@ -281,6 +290,15 @@ impl Scene {
             if running > orch_norm { orch_norm = running; }
         }
 
+        // Distinct piano onset times (sorted) for the next-note + countdown cues.
+        let mut piano_onsets: Vec<f64> = notes
+            .iter()
+            .filter(|n| tracks[n.track].is_piano)
+            .map(|n| n.start)
+            .collect();
+        piano_onsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        piano_onsets.dedup_by(|a, b| (*a - *b).abs() < 0.03);
+
         // Bucket notes by integer second of "needs drawing" interval:
         // visible from (start - lookahead) until particles finish (end + life).
         let n_buckets = (clip_dur.ceil() as usize + 2).max(1);
@@ -310,6 +328,11 @@ impl Scene {
             orchestra_bars,
             tempo_pendulum,
             orch_norm,
+            progress_bar,
+            next_note_cue,
+            countdown_pips,
+            clip_dur,
+            piano_onsets,
         }
     }
 
@@ -349,9 +372,170 @@ impl Scene {
         // Peripheral-vision performance cues, drawn on top (edge-anchored, big).
         if self.orchestra_bars { self.draw_orchestra_bars(&mut pm, t, active); }
         if self.tempo_pendulum { self.draw_tempo_pendulum(&mut pm, t); }
+        // Orientation cues.
+        if self.next_note_cue { self.draw_next_note_cue(&mut pm, t, active); }
+        if self.countdown_pips { self.draw_countdown_pips(&mut pm, t, active); }
         if self.beat_pulse { self.draw_beat_pulse(&mut pm, t); }
+        if self.progress_bar { self.draw_progress_bar(&mut pm, t); }
 
         pm.take()
+    }
+
+    // ── Note geometry (shared by orientation cues) ──────────────────────────
+    // Screen rect of a note at frame time t, clamped at the hit line — mirrors
+    // the geometry in draw_notes.
+    fn note_box(&self, pitch: u8, start: f64, end: f64, t: f64) -> (f32, f32, f32, f32) {
+        let (lane, lane_w) = key_span(pitch as i32, self.key_extent);
+        let head = self.time_to_axis(start - t);
+        let tail = self.time_to_axis(end - t);
+        if self.horizontal {
+            let x0 = head.max(self.hit);
+            let x1 = tail.min(self.width as f32 + 20.0);
+            let ky = self.key_extent - lane - lane_w;
+            (x0, ky + 0.5, (x1 - x0).max(2.0), (lane_w - 1.0).max(1.5))
+        } else {
+            let y1 = head.min(self.hit);
+            let y0 = tail.max(-20.0);
+            (lane + 0.5, y0, (lane_w - 1.0).max(1.5), (y1 - y0).max(2.0))
+        }
+    }
+
+    // ── Progress bar (macro orientation: where in the piece) ────────────────
+    fn draw_progress_bar(&self, pm: &mut Pixmap, t: f64) {
+        if self.clip_dur <= 0.0 { return; }
+        let w = self.width as f32;
+        let frac = (t / self.clip_dur).clamp(0.0, 1.0) as f32;
+        let pad = w * 0.04;
+        let bw = w - pad * 2.0;
+        let y = 14.0;
+        let h = 9.0;
+        // Track
+        fill_round_rect(pm, pad, y, bw, h, h / 2.0, &solid(Color::from_rgba8(255, 255, 255, 32), BlendMode::SourceOver));
+        // Coarse structure ticks (eighths of the clip)
+        for i in 1..8 {
+            let tx = pad + bw * (i as f32 / 8.0);
+            fill_rect(pm, tx - 0.5, y - 2.0, 1.0, h + 4.0, &solid(Color::from_rgba8(255, 255, 255, 40), BlendMode::SourceOver));
+        }
+        // Fill
+        let fillw = bw * frac;
+        if fillw > 1.0 {
+            if let Some(p) = linear_grad(
+                (pad, 0.0), (pad + bw, 0.0),
+                vec![
+                    GradientStop::new(0.0, rgba([90, 200, 255], 0.85)),
+                    GradientStop::new(1.0, rgba([150, 230, 255], 0.95)),
+                ],
+                BlendMode::SourceOver,
+            ) {
+                fill_round_rect(pm, pad, y, fillw, h, h / 2.0, &p);
+            }
+        }
+        // Playhead knob
+        let hx = pad + fillw;
+        glow_disc(pm, hx, y + h / 2.0, 16.0, [150, 230, 255], 0.5);
+        let mut pb = PathBuilder::new();
+        pb.push_circle(hx, y + h / 2.0, h * 0.9);
+        if let Some(path) = pb.finish() {
+            pm.fill_path(&path, &solid(rgba([220, 245, 255], 1.0), BlendMode::SourceOver),
+                FillRule::Winding, Transform::identity(), None);
+        }
+    }
+
+    // ── Next-note cue (micro: highlight the immediate upcoming piano notes) ──
+    fn draw_next_note_cue(&self, pm: &mut Pixmap, t: f64, active: &[u32]) {
+        // Find the nearest upcoming piano onset (still ahead of the hit line).
+        let mut next = f64::INFINITY;
+        for &ni in active {
+            let n = &self.notes[ni as usize];
+            if !self.tracks[n.track].is_piano { continue; }
+            if n.start >= t - 0.03 && n.start < next { next = n.start; }
+        }
+        if !next.is_finite() { return; }
+        let lead = (next - t) as f32;
+        if lead > self.lookahead as f32 { return; }
+        let prox = (1.0 - lead / self.lookahead as f32).clamp(0.0, 1.0);
+        let pulse = 0.55 + 0.45 * ((t * 7.0).sin() as f32);
+        let alpha = (0.35 + prox * 0.55) * pulse;
+        let cue = [120, 235, 255];
+
+        for &ni in active {
+            let n = &self.notes[ni as usize];
+            if !self.tracks[n.track].is_piano { continue; }
+            if (n.start - next).abs() > 0.03 { continue; }
+            let (x, y, bw, bh) = self.note_box(n.pitch, n.start, n.end, t);
+
+            // Guide line in the lane from the note down to the hit line.
+            if self.horizontal {
+                let cy = y + bh / 2.0;
+                fill_rect(pm, self.hit, cy - 0.75, (x - self.hit).max(0.0), 1.5, &solid(rgba(cue, 0.18 * pulse), BlendMode::Plus));
+            } else {
+                let cx = x + bw / 2.0;
+                fill_rect(pm, cx - 0.75, y + bh, 1.5, (self.hit - (y + bh)).max(0.0), &solid(rgba(cue, 0.18 * pulse), BlendMode::Plus));
+            }
+
+            // Glow + outline ring around the note.
+            glow_disc(pm, x + bw / 2.0, y + bh / 2.0, (bw.max(bh)) * 1.6 + 8.0, cue, 0.25 * alpha);
+            let mut pb = PathBuilder::new();
+            round_rect(&mut pb, x - 3.5, y - 3.5, bw + 7.0, bh + 7.0, (bw.min(bh) * 0.4 + 3.0).min(8.0));
+            if let Some(path) = pb.finish() {
+                let stroke = Stroke { width: 2.2, ..Stroke::default() };
+                pm.stroke_path(&path, &solid(rgba(lighten(cue, 0.3), (0.6 + prox * 0.4) * pulse), BlendMode::Plus),
+                    &stroke, Transform::identity(), None);
+            }
+        }
+    }
+
+    // ── Re-entry countdown (meso: count yourself back in after a rest) ──────
+    fn draw_countdown_pips(&self, pm: &mut Pixmap, t: f64, active: &[u32]) {
+        // Skip if the piano is currently playing — only count during rests.
+        for &ni in active {
+            let n = &self.notes[ni as usize];
+            if self.tracks[n.track].is_piano && t >= n.start && t <= n.end { return; }
+        }
+        // Next piano onset.
+        let idx = self.piano_onsets.partition_point(|o| *o <= t);
+        if idx >= self.piano_onsets.len() { return; }
+        let next = self.piano_onsets[idx];
+        let gap = next - t;
+        if gap > self.lookahead + 1.0 { return; } // too far off; don't clutter
+
+        // Beats remaining until the entrance (those strictly after t, up to next).
+        let bstart = self.beats.partition_point(|b| *b <= t);
+        let bend = self.beats.partition_point(|b| *b <= next + 1e-6);
+        let beats_left = bend.saturating_sub(bstart);
+        if beats_left == 0 || beats_left > 12 { return; }
+
+        // Row of pips centered horizontally, just inside the note field above
+        // the keyboard. The imminent pip pulses; passed beats are gone already
+        // (we only draw the remaining count).
+        let w = self.width as f32;
+        let h = self.height as f32;
+        let n = beats_left.min(8);
+        let r = (w.min(h) * 0.012).max(7.0);
+        let gapx = r * 3.2;
+        let total = gapx * (n.saturating_sub(1)) as f32;
+        // Center of the note field.
+        let cx0 = if self.horizontal { self.kb_size + (w - self.kb_size) / 2.0 } else { w / 2.0 };
+        let start_x = cx0 - total / 2.0;
+        let cy = if self.horizontal { h - h * 0.12 } else { self.hit - h * 0.10 };
+        let color = [255, 210, 120];
+
+        // Fraction toward the next beat → the nearest pip swells.
+        let next_beat = self.beats.get(bstart).copied().unwrap_or(next);
+        let to_next_beat = (next_beat - t).max(0.0);
+        for i in 0..n {
+            let px = start_x + gapx * i as f32;
+            let imminent = i == 0;
+            let swell = if imminent { 1.0 + 0.5 * (1.0 - (to_next_beat as f32 / 0.6).min(1.0)) } else { 1.0 };
+            let a = if imminent { 0.95 } else { 0.4 + 0.5 * (1.0 - i as f32 / n as f32) };
+            glow_disc(pm, px, cy, r * swell * 2.2, color, 0.3 * a);
+            let mut pb = PathBuilder::new();
+            pb.push_circle(px, cy, r * swell);
+            if let Some(path) = pb.finish() {
+                pm.fill_path(&path, &solid(rgba(lighten(color, if imminent { 0.4 } else { 0.0 }), a), BlendMode::Plus),
+                    FillRule::Winding, Transform::identity(), None);
+            }
+        }
     }
 
     // ── Peripheral beat pulse ───────────────────────────────────────────────

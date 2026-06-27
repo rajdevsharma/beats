@@ -38,6 +38,12 @@ pub struct VideoOptions {
     pub orchestra_bars: bool,
     #[serde(default)]
     pub tempo_pendulum: bool,
+    #[serde(default)]
+    pub progress_bar: bool,
+    #[serde(default)]
+    pub next_note_cue: bool,
+    #[serde(default)]
+    pub countdown_pips: bool,
     /// Playback speed as a fraction (1.0 = normal, 0.8 = 80% for slow practice).
     /// Audio is time-stretched (pitch-preserved) and the visuals slowed to match.
     #[serde(default = "default_speed")]
@@ -157,6 +163,9 @@ pub async fn export_video(
             options.beat_pulse,
             options.orchestra_bars,
             options.tempo_pendulum,
+            options.progress_bar,
+            options.next_note_cue,
+            options.countdown_pips,
         );
 
         // ── Stage 5: render frames → ffmpeg (40–100 %) ─────────────────────
@@ -295,15 +304,19 @@ mod tests {
         }
         // A doubling: orchestra on the same pitch as piano — piano must stay visible
         notes.push(SceneNote { start: 4.2, end: 6.0, pitch: 60, vel: 0.9, track: 1 });
+        // Late piano re-entrance after a rest (exercises the countdown cue).
+        for p in [60u8, 67] {
+            notes.push(SceneNote { start: 9.0, end: 10.0, pitch: p, vel: 0.9, track: 0 });
+        }
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true)
+        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true)
     }
 
     #[test]
     fn renders_sample_frames() {
         for (name, horizontal) in [("vertical", false), ("horizontal", true)] {
             let scene = test_scene(horizontal);
-            for t in [5.05f64, 6.5] {
+            for t in [5.05f64, 6.5, 7.5] {
                 let data = scene.render_frame(t);
                 assert_eq!(data.len(), 1280 * 720 * 4);
                 let pm = tiny_skia::Pixmap::from_vec(

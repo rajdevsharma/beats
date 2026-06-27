@@ -2500,6 +2500,9 @@ export default function WaveformEditor({
           beat_pulse: opts.beatPulse,
           orchestra_bars: opts.orchestraBars,
           tempo_pendulum: opts.tempoPendulum,
+          progress_bar: opts.progressBar,
+          next_note_cue: opts.nextNoteCue,
+          countdown_pips: opts.countdownPips,
         },
       });
     } catch (e) {

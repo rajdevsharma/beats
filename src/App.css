@@ -752,6 +752,16 @@ html, body, #root {
   border-radius: 14px;
   width: 420px;
   box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  /* Cap to the viewport and let the body scroll between a fixed header/footer
+     so tall modals (e.g. video export) never overflow the screen. */
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.modal-header,
+.modal-footer {
+  flex-shrink: 0;
 }
 
 .modal-header {
@@ -789,6 +799,8 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow-y: auto;
+  min-height: 0; /* allow the flex child to shrink and scroll */
 }
 
 .modal-row {

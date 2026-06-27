@@ -48,7 +48,16 @@ pub struct VideoOptions {
     /// Audio is time-stretched (pitch-preserved) and the visuals slowed to match.
     #[serde(default = "default_speed")]
     pub speed: f64,
+    /// Optional full-screen background video. The first <video length> seconds
+    /// are used; the visualization is composited on top with a transparent field.
+    #[serde(default)]
+    pub bg_video_path: Option<String>,
+    /// Background dimmer, 0..1 (1 = full brightness). Lower = competes less.
+    #[serde(default = "default_brightness")]
+    pub bg_brightness: f64,
 }
+
+fn default_brightness() -> f64 { 1.0 }
 
 fn default_speed() -> f64 { 1.0 }
 
@@ -166,6 +175,7 @@ pub async fn export_video(
             options.progress_bar,
             options.next_note_cue,
             options.countdown_pips,
+            options.bg_video_path.is_some(),
         );
 
         // ── Stage 5: render frames → ffmpeg (40–100 %) ─────────────────────
@@ -176,18 +186,48 @@ pub async fn export_video(
         let frame_count = (clip_dur / speed * fps as f64).ceil() as u64;
         let size_arg = format!("{}x{}", options.width, options.height);
         let fps_arg = fps.to_string();
+        let out_dur = clip_dur / speed; // final video length in seconds
+        let w = options.width;
+        let h = options.height;
 
-        let mut args: Vec<String> = vec![
-            "-y".into(),
-            // video: raw RGBA frames on stdin
+        // The rawvideo frames + stretched wav are always inputs. With a bg video
+        // we add it as input 0 and composite our (transparent-field) frames on top.
+        let mut args: Vec<String> = vec!["-y".into()];
+
+        let has_bg = options.bg_video_path.as_ref().is_some_and(|p| !p.is_empty());
+        if let Some(bg) = options.bg_video_path.as_ref().filter(|_| has_bg) {
+            // Input 0: bg video, decode-limited to the output duration (we only
+            // ever use its first <out_dur> seconds).
+            args.extend(["-t".into(), format!("{out_dur:.3}"), "-i".into(), bg.clone()]);
+        }
+        // Input N: raw RGBA frames on stdin.
+        args.extend([
             "-f".into(), "rawvideo".into(),
             "-pix_fmt".into(), "rgba".into(),
             "-video_size".into(), size_arg,
             "-framerate".into(), fps_arg,
             "-i".into(), "pipe:0".into(),
-            // audio: the trimmed, stretched wav
-            "-i".into(), tmp_wav.clone(),
-        ];
+        ]);
+        // Input N+1: the trimmed, (optionally) stretched wav.
+        args.extend(["-i".into(), tmp_wav.clone()]);
+
+        if has_bg {
+            let b = options.bg_brightness.clamp(0.05, 1.0);
+            // [0] bg: cover-fit to frame, match fps, dim via output white point.
+            // [1] fg: our frames (already W×H rgba). Overlay fg on bg.
+            let fc = format!(
+                "[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={fps},\
+                 colorlevels=romax={b}:gomax={b}:bomax={b},setsar=1[bg];\
+                 [bg][1:v]overlay=0:0:eof_action=pass:format=auto[outv]",
+                w = w, h = h, fps = fps, b = b
+            );
+            args.extend([
+                "-filter_complex".into(), fc,
+                "-map".into(), "[outv]".into(),
+                "-map".into(), "2:a".into(),
+            ]);
+        }
+
         args.extend(ffmpeg_video_encoder());
         args.extend([
             "-pix_fmt".into(), "yuv420p".into(),
@@ -309,7 +349,7 @@ mod tests {
             notes.push(SceneNote { start: 9.0, end: 10.0, pitch: p, vel: 0.9, track: 0 });
         }
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true)
+        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true, false)
     }
 
     #[test]
@@ -371,5 +411,61 @@ mod tests {
         assert!(status.success());
         let size = std::fs::metadata(&out).unwrap().len();
         assert!(size > 50_000, "mp4 suspiciously small: {size} bytes");
+    }
+
+    // End-to-end composite over a real background video. Skips unless
+    // BEATS_BG_TEST_VIDEO points at a video file, so it doesn't depend on any
+    // committed asset. Mirrors the export_video filter_complex.
+    #[test]
+    fn composite_over_bg_video() {
+        let Ok(bg) = std::env::var("BEATS_BG_TEST_VIDEO") else {
+            eprintln!("skip: set BEATS_BG_TEST_VIDEO to run");
+            return;
+        };
+        let dir = std::env::temp_dir();
+        let wav = dir.join("beats_bg_test.wav");
+        let out = dir.join("beats_bg_composite.mp4");
+        write_wav(&vec![0.0f32; 44100 * 2 * 3], 2, 44100, wav.to_str().unwrap()).unwrap();
+
+        // transparent_bg = true (last arg)
+        let mut notes = Vec::new();
+        for (i, p) in [60u8, 64, 67, 72, 76].iter().enumerate() {
+            notes.push(SceneNote { start: 4.2 + i as f64 * 0.25, end: 4.2 + i as f64 * 0.25 + 0.9, pitch: *p, vel: 0.85, track: 0 });
+        }
+        for p in [50u8, 57, 62] { notes.push(SceneNote { start: 4.0, end: 9.0, pitch: p, vel: 0.6, track: 1 }); }
+        let tracks = vec![
+            SceneTrack { color: [255, 255, 255], is_piano: true },
+            SceneTrack { color: [80, 160, 255], is_piano: false },
+        ];
+        let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
+        let scene = Scene::new(notes, tracks, beats, 1280, 720, false, 12.0, true, true, false, true, true, true, true);
+
+        let (w, h, fps, b) = (1280, 720, 30, 0.5f64);
+        let fc = format!(
+            "[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={fps},\
+             colorlevels=romax={b}:gomax={b}:bomax={b},setsar=1[bg];\
+             [bg][1:v]overlay=0:0:eof_action=pass:format=auto[outv]"
+        );
+        let mut args: Vec<String> = vec![
+            "-y".into(), "-t".into(), "3".into(), "-i".into(), bg,
+            "-f".into(), "rawvideo".into(), "-pix_fmt".into(), "rgba".into(),
+            "-video_size".into(), "1280x720".into(), "-framerate".into(), "30".into(), "-i".into(), "pipe:0".into(),
+            "-i".into(), wav.to_str().unwrap().into(),
+            "-filter_complex".into(), fc,
+            "-map".into(), "[outv]".into(), "-map".into(), "2:a".into(),
+        ];
+        args.extend(ffmpeg_video_encoder());
+        args.extend(["-pix_fmt".into(), "yuv420p".into(), "-c:a".into(), "aac".into(), "-shortest".into(), out.to_str().unwrap().into()]);
+
+        let mut child = std::process::Command::new("ffmpeg")
+            .args(&args).stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().expect("ffmpeg");
+        let mut stdin = child.stdin.take().unwrap();
+        for i in 0..90 { stdin.write_all(&scene.render_frame(4.0 + i as f64 / 30.0)).unwrap(); }
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        assert!(std::fs::metadata(&out).unwrap().len() > 50_000);
+        eprintln!("composite written: {}", out.display());
     }
 }

@@ -2503,6 +2503,8 @@ export default function WaveformEditor({
           progress_bar: opts.progressBar,
           next_note_cue: opts.nextNoteCue,
           countdown_pips: opts.countdownPips,
+          bg_video_path: opts.bgVideoPath,
+          bg_brightness: opts.bgBrightness,
         },
       });
     } catch (e) {

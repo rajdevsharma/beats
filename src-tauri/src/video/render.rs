@@ -46,6 +46,7 @@ pub struct Scene {
     progress_bar: bool,
     next_note_cue: bool,
     countdown_pips: bool,
+    transparent_bg: bool,      // leave the note field transparent (composite over a bg video)
     clip_dur: f64,             // total clip length, for the progress bar
     piano_onsets: Vec<f64>,    // sorted distinct piano onset times (for cues)
 }
@@ -258,6 +259,7 @@ impl Scene {
         progress_bar: bool,
         next_note_cue: bool,
         countdown_pips: bool,
+        transparent_bg: bool,
     ) -> Scene {
         let (kb_size, hit, key_extent, lookahead) = if horizontal {
             let kb = (width as f32 * 0.085).clamp(110.0, 220.0);
@@ -331,6 +333,7 @@ impl Scene {
             progress_bar,
             next_note_cue,
             countdown_pips,
+            transparent_bg,
             clip_dur,
             piano_onsets,
         }
@@ -730,6 +733,28 @@ impl Scene {
     fn draw_background(&self, pm: &mut Pixmap) {
         let w = self.width as f32;
         let h = self.height as f32;
+        if self.transparent_bg {
+            // Leave the note field transparent so the bg video shows through.
+            // A gentle scrim deepening toward the hit line keeps notes readable
+            // over bright footage without fully hiding the video. (The keyboard
+            // strip is drawn opaque later by draw_keyboard.)
+            let scrim = if self.horizontal {
+                linear_grad((self.hit, 0.0), (w, 0.0),
+                    vec![
+                        GradientStop::new(0.0, Color::from_rgba8(6, 6, 12, 150)),
+                        GradientStop::new(1.0, Color::from_rgba8(6, 6, 12, 40)),
+                    ], BlendMode::SourceOver)
+            } else {
+                linear_grad((0.0, self.hit), (0.0, 0.0),
+                    vec![
+                        GradientStop::new(0.0, Color::from_rgba8(6, 6, 12, 150)),
+                        GradientStop::new(1.0, Color::from_rgba8(6, 6, 12, 40)),
+                    ], BlendMode::SourceOver)
+            };
+            if let Some(p) = scrim { fill_rect(pm, 0.0, 0.0, w, h, &p); }
+            // Skip the opaque gradient + lane lines (lane lines over video add noise).
+            return;
+        }
         let stops = vec![
             GradientStop::new(0.0, Color::from_rgba8(10, 10, 20, 255)),
             GradientStop::new(0.75, Color::from_rgba8(13, 12, 26, 255)),

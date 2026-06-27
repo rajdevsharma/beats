@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 type CueKey =
   | "beatPulse" | "orchestraBars" | "tempoPendulum"
@@ -9,6 +10,8 @@ export interface VideoExportOpts extends Record<CueKey, boolean> {
   start: number;
   end: number;
   speed: number; // fraction: 1 = normal, 0.8 = 80% for slow practice
+  bgVideoPath: string | null; // full-screen background video (any local file)
+  bgBrightness: number;       // 0..1 dimmer for the background
 }
 
 const CUE_DEFAULTS: Record<CueKey, boolean> = {
@@ -53,6 +56,13 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
   const [startStr, setStartStr] = useState("0:00");
   const [endStr, setEndStr] = useState(formatTime(totalDuration));
   const [speedStr, setSpeedStr] = useState("100");
+  const [bgVideoPath, setBgVideoPath] = useState<string | null>(() =>
+    localStorage.getItem("beats_video_bg_path") || null
+  );
+  const [bgBrightnessPct, setBgBrightnessPct] = useState(() => {
+    const v = parseInt(localStorage.getItem("beats_video_bg_brightness") ?? "60");
+    return isFinite(v) ? v : 60;
+  });
   const [cues, setCues] = useState<Record<string, boolean>>(() => {
     try {
       const raw = localStorage.getItem("beats_video_cues");
@@ -72,12 +82,32 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
   const clipDur = valid ? Math.min(end!, totalDuration) - start! : null;
   const videoLen = clipDur !== null ? clipDur / (speedPct / 100) : null;
 
+  async function pickBgVideo() {
+    const sel = await openDialog({
+      title: "Choose a background video",
+      multiple: false,
+      filters: [{ name: "Video", extensions: ["mp4", "mov", "mkv", "webm", "m4v", "avi"] }],
+    });
+    if (typeof sel === "string") {
+      setBgVideoPath(sel);
+      localStorage.setItem("beats_video_bg_path", sel);
+    }
+  }
+
+  function clearBgVideo() {
+    setBgVideoPath(null);
+    localStorage.removeItem("beats_video_bg_path");
+  }
+
   function handleConfirm() {
     if (!valid) return;
     localStorage.setItem("beats_video_cues", JSON.stringify(cues));
+    localStorage.setItem("beats_video_bg_brightness", String(bgBrightnessPct));
     onConfirm({
       speed: speedPct / 100,
       orientation, start: start!, end: Math.min(end!, totalDuration),
+      bgVideoPath,
+      bgBrightness: bgBrightnessPct / 100,
       beatPulse: !!cues.beatPulse,
       orchestraBars: !!cues.orchestraBars,
       tempoPendulum: !!cues.tempoPendulum,
@@ -86,6 +116,8 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
       countdownPips: !!cues.countdownPips,
     });
   }
+
+  const bgName = bgVideoPath ? bgVideoPath.split("/").pop() : null;
 
   return (
     <div className="modal-backdrop" onClick={(e) => e.target === e.currentTarget && onCancel()}>
@@ -167,6 +199,50 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
           <p className="modal-hint">
             &lt;100% = slower for practice (pitch preserved) &nbsp;·&nbsp; &gt;100% = faster
           </p>
+
+          <div className="modal-divider" />
+
+          <div className="modal-row">
+            <span className="modal-label">Background video</span>
+            <div className="bg-video-pick">
+              {bgName ? (
+                <>
+                  <span className="bg-video-name" title={bgVideoPath!}>{bgName}</span>
+                  <button className="bg-video-btn" onClick={pickBgVideo}>Change</button>
+                  <button className="bg-video-btn" onClick={clearBgVideo}>✕</button>
+                </>
+              ) : (
+                <button className="bg-video-btn" onClick={pickBgVideo}>Choose video…</button>
+              )}
+            </div>
+          </div>
+          {bgVideoPath ? (
+            <>
+              <div className="modal-row modal-row-input">
+                <label className="modal-label" htmlFor="bg-bright">Dimmer</label>
+                <div className="modal-input-group" style={{ gap: 8 }}>
+                  <input
+                    id="bg-bright"
+                    type="range"
+                    min={10}
+                    max={100}
+                    step={5}
+                    value={bgBrightnessPct}
+                    onChange={(e) => setBgBrightnessPct(parseInt(e.target.value))}
+                    style={{ width: 120, accentColor: "var(--accent)" }}
+                  />
+                  <span className="modal-value mono" style={{ minWidth: 38 }}>{bgBrightnessPct}%</span>
+                </div>
+              </div>
+              <p className="modal-hint">
+                Plays full-screen behind the visualization (first {formatTime(videoLen ?? 0)} of the clip). Lower = competes less.
+              </p>
+            </>
+          ) : (
+            <p className="modal-hint">
+              Optional — overlay the visualization on any video as a memorable landmark backdrop.
+            </p>
+          )}
 
           <div className="modal-divider" />
 

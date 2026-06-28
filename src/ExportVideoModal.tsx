@@ -3,7 +3,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 type CueKey =
   | "beatPulse" | "orchestraBars" | "tempoPendulum"
-  | "progressBar" | "nextNoteCue" | "countdownPips";
+  | "progressBar" | "nextNoteCue" | "countdownPips" | "orchestra";
 
 export interface VideoExportOpts extends Record<CueKey, boolean> {
   orientation: "vertical" | "horizontal";
@@ -16,10 +16,11 @@ export interface VideoExportOpts extends Record<CueKey, boolean> {
 
 const CUE_DEFAULTS: Record<CueKey, boolean> = {
   beatPulse: true, orchestraBars: true, tempoPendulum: false,
-  progressBar: true, nextNoteCue: true, countdownPips: true,
+  progressBar: true, nextNoteCue: true, countdownPips: true, orchestra: false,
 };
 
 const CUES: { key: CueKey; label: string; desc: string }[] = [
+  { key: "orchestra", label: "Animated orchestra", desc: "A cartoon orchestra across the top: sections bow/strike from the MIDI, a pianist whose hands track your register, and a conductor on the podium" },
   { key: "progressBar", label: "Progress bar", desc: "Bar across the top tracking your position through the piece — where am I overall" },
   { key: "nextNoteCue", label: "Next-note cue", desc: "Rings the immediate upcoming piano note(s) with a guide line so you always see what you play next" },
   { key: "countdownPips", label: "Re-entry countdown", desc: "During a piano rest, pips count the beats until your next entrance so you come back in on time" },
@@ -114,6 +115,7 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
       progressBar: !!cues.progressBar,
       nextNoteCue: !!cues.nextNoteCue,
       countdownPips: !!cues.countdownPips,
+      orchestra: !!cues.orchestra,
     });
   }
 

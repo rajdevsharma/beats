@@ -17,9 +17,49 @@ pub struct SceneNote {
     pub track: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Strings,
+    Woodwind,
+    Brass,
+    Perc,
+    Piano,
+    Other,
+}
+
+impl Family {
+    pub fn from_str(s: &str) -> Family {
+        match s {
+            "strings" => Family::Strings,
+            "woodwind" => Family::Woodwind,
+            "brass" => Family::Brass,
+            "perc" => Family::Perc,
+            "piano" => Family::Piano,
+            _ => Family::Other,
+        }
+    }
+    fn idx(self) -> usize {
+        match self {
+            Family::Strings => 0, Family::Woodwind => 1, Family::Brass => 2,
+            Family::Perc => 3, Family::Piano => 4, Family::Other => 5,
+        }
+    }
+    fn label_color(self) -> [u8; 3] {
+        match self {
+            Family::Strings => [120, 200, 255],
+            Family::Woodwind => [140, 230, 150],
+            Family::Brass => [255, 200, 90],
+            Family::Perc => [230, 150, 230],
+            Family::Piano => [255, 255, 255],
+            Family::Other => [200, 200, 210],
+        }
+    }
+}
+
 pub struct SceneTrack {
     pub color: [u8; 3],
     pub is_piano: bool,
+    pub family: Family,
 }
 
 pub struct Scene {
@@ -47,8 +87,10 @@ pub struct Scene {
     next_note_cue: bool,
     countdown_pips: bool,
     transparent_bg: bool,      // leave the note field transparent (composite over a bg video)
+    orchestra: bool,           // animated 2D orchestra pit across the top
     clip_dur: f64,             // total clip length, for the progress bar
     piano_onsets: Vec<f64>,    // sorted distinct piano onset times (for cues)
+    pit_families: Vec<Family>, // distinct non-piano families present, seating order
 }
 
 const PARTICLE_MAX_LIFE: f64 = 0.85;
@@ -260,6 +302,7 @@ impl Scene {
         next_note_cue: bool,
         countdown_pips: bool,
         transparent_bg: bool,
+        orchestra: bool,
     ) -> Scene {
         let (kb_size, hit, key_extent, lookahead) = if horizontal {
             let kb = (width as f32 * 0.085).clamp(110.0, 220.0);
@@ -301,6 +344,15 @@ impl Scene {
         piano_onsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
         piano_onsets.dedup_by(|a, b| (*a - *b).abs() < 0.03);
 
+        // Distinct non-piano families present, in a fixed left→right seating
+        // order, for the orchestra pit. Piano is drawn as the pianist, separately.
+        let order = [Family::Strings, Family::Woodwind, Family::Brass, Family::Perc, Family::Other];
+        let pit_families: Vec<Family> = order
+            .iter()
+            .copied()
+            .filter(|f| tracks.iter().any(|t| t.family == *f && !t.is_piano))
+            .collect();
+
         // Bucket notes by integer second of "needs drawing" interval:
         // visible from (start - lookahead) until particles finish (end + life).
         let n_buckets = (clip_dur.ceil() as usize + 2).max(1);
@@ -334,8 +386,10 @@ impl Scene {
             next_note_cue,
             countdown_pips,
             transparent_bg,
+            orchestra,
             clip_dur,
             piano_onsets,
+            pit_families,
         }
     }
 
@@ -370,7 +424,12 @@ impl Scene {
         self.draw_hit_line(&mut pm, t);
         self.draw_keyboard(&mut pm, t, active);
         self.draw_particles(&mut pm, t, active);
-        self.draw_conductor(&mut pm, t);
+        // The orchestra pit has its own conductor; otherwise draw the corner one.
+        if self.orchestra {
+            self.draw_orchestra(&mut pm, t, active);
+        } else {
+            self.draw_conductor(&mut pm, t);
+        }
 
         // Peripheral-vision performance cues, drawn on top (edge-anchored, big).
         if self.orchestra_bars { self.draw_orchestra_bars(&mut pm, t, active); }
@@ -1400,6 +1459,282 @@ impl Scene {
                 let k = (age / 0.15) as f32;
                 let (fx, fy) = self.baton_tip(self.beats[i - 1] + 1e-4, cx, base_y);
                 glow_disc(pm, fx, fy, 16.0 + 22.0 * k, [255, 225, 170], 0.5 * (1.0 - k));
+            }
+        }
+    }
+
+    // ── Animated 2D orchestra pit ───────────────────────────────────────────
+    // A stage band across the top with one animated figure per instrument
+    // family present, a pianist whose hands track the active register, and a
+    // conductor on the podium. All driven analytically from the active notes.
+
+    fn limb(pm: &mut Pixmap, x0: f32, y0: f32, x1: f32, y1: f32, wd: f32, color: Color) {
+        let mut pb = PathBuilder::new();
+        pb.move_to(x0, y0);
+        pb.line_to(x1, y1);
+        if let Some(path) = pb.finish() {
+            let stroke = Stroke { width: wd, line_cap: LineCap::Round, ..Stroke::default() };
+            pm.stroke_path(&path, &solid(color, BlendMode::SourceOver), &stroke, Transform::identity(), None);
+        }
+    }
+
+    fn disc(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, color: Color) {
+        let mut pb = PathBuilder::new();
+        pb.push_circle(cx, cy, r);
+        if let Some(path) = pb.finish() {
+            pm.fill_path(&path, &solid(color, BlendMode::SourceOver), FillRule::Winding, Transform::identity(), None);
+        }
+    }
+
+    /// Per-family (level 0..1 of currently sounding notes, seconds since latest
+    /// onset). Index by Family::idx.
+    fn family_activity(&self, t: f64, active: &[u32]) -> [(f32, f32); 6] {
+        let mut acts = [(0.0f32, 9.0f32); 6];
+        for &ni in active {
+            let n = &self.notes[ni as usize];
+            let fi = self.tracks[n.track].family.idx();
+            if t >= n.start && t <= n.end {
+                if n.vel > acts[fi].0 { acts[fi].0 = n.vel; }
+            }
+            let age = (t - n.start) as f32;
+            if age >= 0.0 && age < acts[fi].1 { acts[fi].1 = age; }
+        }
+        acts
+    }
+
+    fn draw_orchestra(&self, pm: &mut Pixmap, t: f64, active: &[u32]) {
+        let w = self.width as f32;
+        let band_h = (self.height as f32 * 0.32).clamp(200.0, 380.0);
+
+        // Stage backing: solid at the top fading near the band's bottom edge so
+        // figures read clearly and far-future notes behind the band are hidden.
+        if let Some(p) = linear_grad(
+            (0.0, 0.0), (0.0, band_h),
+            vec![
+                GradientStop::new(0.0, Color::from_rgba8(9, 10, 18, 250)),
+                GradientStop::new(0.82, Color::from_rgba8(11, 12, 22, 238)),
+                GradientStop::new(1.0, Color::from_rgba8(12, 12, 24, 0)),
+            ],
+            BlendMode::SourceOver,
+        ) {
+            fill_rect(pm, 0.0, 0.0, w, band_h, &p);
+        }
+        // Stage floor line + warm footlight glow along the front.
+        fill_rect(pm, 0.0, band_h - 2.0, w, 2.0, &solid(rgba([255, 200, 130], 0.25), BlendMode::Plus));
+        if let Some(p) = linear_grad(
+            (0.0, band_h), (0.0, band_h - 40.0),
+            vec![
+                GradientStop::new(0.0, rgba([255, 200, 120], 0.22)),
+                GradientStop::new(1.0, rgba([255, 200, 120], 0.0)),
+            ],
+            BlendMode::Plus,
+        ) {
+            fill_rect(pm, 0.0, band_h - 40.0, w, 40.0, &p);
+        }
+
+        let acts = self.family_activity(t, active);
+
+        // Seating: sections spread across the back of the band on a shallow arc;
+        // pianist front-left, conductor front-center.
+        let n_sec = self.pit_families.len().max(1) as f32;
+        let margin = w * 0.10;
+        let usable = w - margin * 2.0;
+        let scale = (band_h * 0.0108).clamp(1.5, 2.7);
+        let back_y = band_h * 0.36;
+
+        for (i, fam) in self.pit_families.iter().enumerate() {
+            let fx = if self.pit_families.len() == 1 {
+                w * 0.62
+            } else {
+                margin + usable * (i as f32 / (n_sec - 1.0))
+            };
+            // shallow arc — ends sit a touch lower
+            let arc = ((i as f32 / (n_sec - 1.0).max(1.0)) - 0.5).abs() * 2.0;
+            let fy = back_y + arc * band_h * 0.06;
+            let (level, onset_age) = acts[fam.idx()];
+            self.draw_player(pm, *fam, fx, fy, scale, level, onset_age, t, i);
+        }
+
+        // Pianist (front-left) — only if a piano part exists.
+        if self.tracks.iter().any(|tk| tk.is_piano) {
+            let px = margin + usable * 0.10;
+            let py = band_h * 0.70;
+            self.draw_pianist(pm, px, py, scale * 1.1, t, active);
+        }
+
+        // Conductor on the podium, front-center, facing the orchestra.
+        self.draw_pit_conductor(pm, w * 0.5, band_h * 0.92, scale * 1.1, t);
+    }
+
+    /// One seated section player, animated by its family's activity.
+    fn draw_player(&self, pm: &mut Pixmap, fam: Family, cx: f32, cy: f32, scale: f32,
+                   level: f32, onset_age: f32, t: f64, seed: usize) {
+        let s = scale;
+        let skin = Color::from_rgba8(232, 198, 168, 255);
+        let body_c = fam.label_color();
+        let body = rgba(darken(body_c, 0.35), 0.95);
+        let limb_c = rgba(darken(body_c, 0.2), 0.95);
+        let phase = (seed as f64 * 1.7) % 6.28;
+        // gentle idle sway + onset bob
+        let onset_bob = (0.18 - onset_age as f64).max(0.0) as f32 / 0.18; // 1→0 over 180ms
+        let sway = ((t * 1.3 + phase).sin() as f32) * 1.5 * s;
+        let cy = cy - onset_bob * 3.0 * s;
+        let cx = cx + sway;
+
+        // Torso (trapezoid via rounded rect) + head + glow when active.
+        if level > 0.02 {
+            glow_disc(pm, cx, cy - 14.0 * s, 34.0 * s * (0.6 + level), lighten(body_c, 0.3), 0.18 + level * 0.22);
+        }
+        fill_round_rect(pm, cx - 10.0 * s, cy - 4.0 * s, 20.0 * s, 26.0 * s, 6.0 * s, &solid(body, BlendMode::SourceOver));
+        Self::disc(pm, cx, cy - 14.0 * s, 7.0 * s, skin);
+
+        let active_amt = level.max(onset_bob * 0.7);
+        match fam {
+            Family::Strings => {
+                // Instrument tucked under chin (left), bow sawing across (right).
+                let inst_x = cx - 11.0 * s; let inst_y = cy - 12.0 * s;
+                Self::limb(pm, cx - 4.0 * s, cy - 2.0 * s, inst_x, inst_y, 3.2 * s, limb_c); // left arm up
+                // violin body
+                fill_round_rect(pm, inst_x - 4.0 * s, inst_y - 2.0 * s, 14.0 * s, 5.0 * s, 2.5 * s,
+                    &solid(rgba([150, 95, 55], 1.0), BlendMode::SourceOver));
+                // bow saws back and forth; amplitude = activity
+                let saw = ((t * 7.0 + phase).sin() as f32) * active_amt;
+                let bx = inst_x + 7.0 * s + saw * 9.0 * s;
+                let by = inst_y + 1.0 * s;
+                Self::limb(pm, cx + 4.0 * s, cy - 1.0 * s, bx, by, 3.0 * s, limb_c); // bow arm
+                Self::limb(pm, bx - 9.0 * s, by - 3.0 * s, bx + 5.0 * s, by + 3.0 * s, 1.6 * s,
+                    rgba([240, 230, 210], 0.95)); // the bow
+            }
+            Family::Brass => {
+                // Bell points up-forward, lifts with activity; glow at the bell.
+                let lift = active_amt;
+                let bx = cx + 6.0 * s; let by = cy - 6.0 * s - lift * 6.0 * s;
+                Self::limb(pm, cx + 5.0 * s, cy + 2.0 * s, bx, by + 6.0 * s, 3.0 * s, limb_c);
+                // cone bell
+                let mut pb = PathBuilder::new();
+                pb.move_to(bx - 2.0 * s, by + 8.0 * s);
+                pb.line_to(bx + 8.0 * s, by - 6.0 * s);
+                pb.line_to(bx + 13.0 * s, by - 3.0 * s);
+                pb.line_to(bx + 3.0 * s, by + 11.0 * s);
+                pb.close();
+                if let Some(path) = pb.finish() {
+                    pm.fill_path(&path, &solid(rgba([235, 195, 90], 1.0), BlendMode::SourceOver),
+                        FillRule::Winding, Transform::identity(), None);
+                }
+                if level > 0.02 { glow_disc(pm, bx + 10.0 * s, by - 4.0 * s, 16.0 * s, [255, 220, 120], 0.4 * level); }
+            }
+            Family::Woodwind => {
+                // Vertical pipe to the mouth; bob + finger shimmer on activity.
+                let px = cx + 2.0 * s;
+                Self::limb(pm, cx, cy - 13.0 * s, px, cy + 4.0 * s, 2.6 * s,
+                    rgba([40, 40, 48], 1.0)); // the pipe
+                Self::limb(pm, cx + 5.0 * s, cy + 1.0 * s, px, cy - 2.0 * s, 2.8 * s, limb_c);
+                if active_amt > 0.05 {
+                    let f = ((t * 11.0 + phase).sin() as f32) * 0.5 + 0.5;
+                    Self::disc(pm, px, cy - 4.0 * s + f * 2.0 * s, 1.3 * s, rgba(lighten(body_c, 0.4), 0.9 * active_amt));
+                }
+            }
+            Family::Perc => {
+                // Two mallets strike down on a drum when there's a recent onset.
+                let strike = 1.0 - (onset_age / 0.16).min(1.0); // 1 just after onset
+                let dy = cy + 8.0 * s;
+                fill_round_rect(pm, cx - 9.0 * s, dy, 18.0 * s, 7.0 * s, 3.0 * s,
+                    &solid(rgba([180, 120, 80], 1.0), BlendMode::SourceOver)); // drum
+                for k in [-1.0f32, 1.0] {
+                    let hy = cy - 6.0 * s + strike * 11.0 * s;
+                    let hx = cx + k * 5.0 * s;
+                    Self::limb(pm, cx + k * 4.0 * s, cy - 1.0 * s, hx, hy, 2.2 * s, limb_c);
+                    Self::disc(pm, hx, hy + 2.0 * s, 1.8 * s, rgba([230, 220, 205], 1.0));
+                }
+                if strike > 0.4 { glow_disc(pm, cx, dy, 20.0 * s, [255, 220, 160], 0.4 * strike); }
+            }
+            _ => {
+                // Generic: arms that lift gently with activity.
+                let lift = active_amt * 5.0 * s;
+                Self::limb(pm, cx - 5.0 * s, cy + 2.0 * s, cx - 10.0 * s, cy - 4.0 * s - lift, 2.8 * s, limb_c);
+                Self::limb(pm, cx + 5.0 * s, cy + 2.0 * s, cx + 10.0 * s, cy - 4.0 * s - lift, 2.8 * s, limb_c);
+            }
+        }
+    }
+
+    /// The pianist: seated at a small grand, hands tracking the active register.
+    fn draw_pianist(&self, pm: &mut Pixmap, cx: f32, cy: f32, scale: f32, t: f64, active: &[u32]) {
+        let s = scale;
+        let skin = Color::from_rgba8(232, 198, 168, 255);
+
+        // Active piano pitch span → hand targets over a mini keyboard.
+        let (mut lo, mut hi, mut any, mut onset) = (127i32, 0i32, false, 9.0f32);
+        for &ni in active {
+            let n = &self.notes[ni as usize];
+            if !self.tracks[n.track].is_piano { continue; }
+            if t >= n.start && t <= n.end {
+                any = true;
+                lo = lo.min(n.pitch as i32); hi = hi.max(n.pitch as i32);
+            }
+            let age = (t - n.start) as f32;
+            if age >= 0.0 && age < onset { onset = age; }
+        }
+        let kb_w = 46.0 * s;
+        let kb_x = cx - kb_w * 0.5;
+        let kb_y = cy + 6.0 * s;
+        // mini grand body + keyboard
+        fill_round_rect(pm, kb_x - 6.0 * s, kb_y - 3.0 * s, kb_w + 12.0 * s, 12.0 * s, 3.0 * s,
+            &solid(Color::from_rgba8(18, 18, 24, 255), BlendMode::SourceOver));
+        fill_round_rect(pm, kb_x, kb_y, kb_w, 4.5 * s, 1.5 * s,
+            &solid(Color::from_rgba8(235, 235, 240, 255), BlendMode::SourceOver));
+
+        // Map midi 36..96 across the mini keyboard.
+        let map = |p: i32| kb_x + kb_w * ((p - 36).clamp(0, 60) as f32 / 60.0);
+        let onset_dip = (0.12 - onset).max(0.0) / 0.12 * 3.0 * s;
+        let (lx, rx) = if any { (map(lo), map(hi)) } else { (cx - 9.0 * s, cx + 9.0 * s) };
+
+        // Body + head behind the keyboard.
+        fill_round_rect(pm, cx - 9.0 * s, cy - 6.0 * s, 18.0 * s, 22.0 * s, 6.0 * s,
+            &solid(rgba([235, 235, 245], 0.95), BlendMode::SourceOver));
+        Self::disc(pm, cx, cy - 16.0 * s, 7.0 * s, skin);
+        if any { glow_disc(pm, cx, cy - 14.0 * s, 30.0 * s, [255, 255, 255], 0.18); }
+
+        // Arms reaching to each hand position; hands dip on onset.
+        let hy = kb_y - 1.0 * s + onset_dip;
+        Self::limb(pm, cx - 4.0 * s, cy - 2.0 * s, lx, hy, 3.0 * s, rgba([235, 235, 245], 0.95));
+        Self::limb(pm, cx + 4.0 * s, cy - 2.0 * s, rx, hy, 3.0 * s, rgba([235, 235, 245], 0.95));
+        Self::disc(pm, lx, hy, 2.6 * s, skin);
+        Self::disc(pm, rx, hy, 2.6 * s, skin);
+        if any {
+            glow_disc(pm, lx, hy, 9.0 * s, [255, 200, 220], 0.35);
+            glow_disc(pm, rx, hy, 9.0 * s, [255, 200, 220], 0.35);
+        }
+    }
+
+    /// Conductor on the podium, arms beating to the pulse (back to the viewer).
+    fn draw_pit_conductor(&self, pm: &mut Pixmap, cx: f32, cy: f32, scale: f32, t: f64) {
+        let s = scale;
+        let dark = rgba([30, 32, 42], 1.0);
+        // Podium
+        fill_round_rect(pm, cx - 16.0 * s, cy + 14.0 * s, 32.0 * s, 6.0 * s, 2.0 * s,
+            &solid(rgba([60, 50, 40], 1.0), BlendMode::SourceOver));
+        // Body (tailcoat) + head
+        fill_round_rect(pm, cx - 9.0 * s, cy - 6.0 * s, 18.0 * s, 22.0 * s, 6.0 * s, &solid(dark, BlendMode::SourceOver));
+        Self::disc(pm, cx, cy - 16.0 * s, 7.5 * s, Color::from_rgba8(232, 198, 168, 255));
+
+        // Both arms beat: right hand traces the baton swing, left mirrors softly.
+        let base_y = cy - 18.0 * s;
+        let (bx, by) = self.baton_tip(t, cx, base_y);
+        Self::limb(pm, cx + 4.0 * s, cy - 4.0 * s, bx, by, 3.0 * s, rgba([235, 235, 245], 0.95));
+        Self::limb(pm, bx, by, bx + (bx - cx) * 0.5, by - 6.0 * s, 1.8 * s, rgba([255, 244, 215], 0.95)); // baton
+        // left arm phrasing, gentle counter-motion
+        let lh_x = cx - 10.0 * s - ((t * 3.0).cos() as f32) * 4.0 * s;
+        let lh_y = base_y + 4.0 * s + ((t * 3.0).sin() as f32) * 3.0 * s;
+        Self::limb(pm, cx - 4.0 * s, cy - 4.0 * s, lh_x, lh_y, 3.0 * s, rgba([235, 235, 245], 0.95));
+        // baton tip glow + ictus flash
+        glow_disc(pm, bx, by, 9.0 * s, [255, 215, 150], 0.45);
+        let i = self.beats.partition_point(|b| *b <= t);
+        if i > 0 {
+            let age = t - self.beats[i - 1];
+            if age < 0.14 {
+                let k = (age / 0.14) as f32;
+                let (fx, fy) = self.baton_tip(self.beats[i - 1] + 1e-4, cx, base_y);
+                glow_disc(pm, fx, fy, (10.0 + 16.0 * k) * s, [255, 225, 170], 0.5 * (1.0 - k));
             }
         }
     }

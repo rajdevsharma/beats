@@ -283,6 +283,18 @@ export function midiNoteName(m: number): string {
   return `${NOTE_NAMES[((n % 12) + 12) % 12]}${Math.floor(n / 12) - 1}`;
 }
 
+// Classify a MIDI track name into an instrument family for the animated
+// orchestra. Falls back to "other" when the name is unrecognized.
+function instrumentFamily(name: string): string {
+  const n = name.toLowerCase();
+  if (/piano|forte|klavier/.test(n)) return 'piano';
+  if (/violin|viola|cello|contrabass|double ?bass|\bbass\b|string|pizz|arco/.test(n)) return 'strings';
+  if (/trumpet|horn|tromb|tuba|brass|cornet|bugle/.test(n)) return 'brass';
+  if (/flute|picc|oboe|clarinet|bassoon|sax|wind|recorder|english horn|cor anglais/.test(n)) return 'woodwind';
+  if (/timpani|percussion|drum|cymbal|snare|triangle|tambour|glock|xylo|marimba|vibra|chime|gong/.test(n)) return 'perc';
+  return 'other';
+}
+
 // Parse the track colors we generate ('#rrggbb' or 'hsl(h,s%,l%)') to RGB
 // for the Rust video renderer.
 function cssColorToRgb(c: string): [number, number, number] {
@@ -2467,6 +2479,7 @@ export default function WaveformEditor({
     const vTracks = tracks.map((t, i) => ({
       color: cssColorToRgb(t.isPiano ? '#ffffff' : (colors[i] ?? '#ffffff')),
       is_piano: t.isPiano,
+      family: t.isPiano ? 'piano' : instrumentFamily(t.name),
     }));
     const vNotes: { start: number; dur: number; pitch: number; vel: number; track: number }[] = [];
     tracks.forEach((t, ti) => {
@@ -2503,6 +2516,7 @@ export default function WaveformEditor({
           progress_bar: opts.progressBar,
           next_note_cue: opts.nextNoteCue,
           countdown_pips: opts.countdownPips,
+          orchestra: opts.orchestra,
           bg_video_path: opts.bgVideoPath,
           bg_brightness: opts.bgBrightness,
         },

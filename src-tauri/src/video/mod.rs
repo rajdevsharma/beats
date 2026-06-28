@@ -22,6 +22,9 @@ pub struct VideoNote {
 pub struct VideoTrack {
     pub color: [u8; 3],
     pub is_piano: bool,
+    /// Instrument family for the animated orchestra: strings|woodwind|brass|perc|piano|other.
+    #[serde(default)]
+    pub family: String,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +47,8 @@ pub struct VideoOptions {
     pub next_note_cue: bool,
     #[serde(default)]
     pub countdown_pips: bool,
+    #[serde(default)]
+    pub orchestra: bool,
     /// Playback speed as a fraction (1.0 = normal, 0.8 = 80% for slow practice).
     /// Audio is time-stretched (pitch-preserved) and the visuals slowed to match.
     #[serde(default = "default_speed")]
@@ -141,7 +146,11 @@ pub async fn export_video(
         // ── Stage 4: build scene ───────────────────────────────────────────
         let scene_tracks: Vec<SceneTrack> = tracks
             .iter()
-            .map(|t| SceneTrack { color: t.color, is_piano: t.is_piano })
+            .map(|t| SceneTrack {
+                color: t.color,
+                is_piano: t.is_piano,
+                family: if t.is_piano { render::Family::Piano } else { render::Family::from_str(&t.family) },
+            })
             .collect();
         let scene_notes: Vec<SceneNote> = notes
             .iter()
@@ -176,6 +185,7 @@ pub async fn export_video(
             options.next_note_cue,
             options.countdown_pips,
             options.bg_video_path.is_some(),
+            options.orchestra,
         );
 
         // ── Stage 5: render frames → ffmpeg (40–100 %) ─────────────────────
@@ -311,11 +321,12 @@ mod tests {
     use super::*;
 
     fn test_scene(horizontal: bool) -> Scene {
+        use render::Family;
         let tracks = vec![
-            SceneTrack { color: [255, 255, 255], is_piano: true },
-            SceneTrack { color: [80, 160, 255], is_piano: false },
-            SceneTrack { color: [255, 90, 90], is_piano: false },
-            SceneTrack { color: [255, 200, 60], is_piano: false },
+            SceneTrack { color: [255, 255, 255], is_piano: true, family: Family::Piano },
+            SceneTrack { color: [80, 160, 255], is_piano: false, family: Family::Strings },
+            SceneTrack { color: [255, 90, 90], is_piano: false, family: Family::Brass },
+            SceneTrack { color: [255, 200, 60], is_piano: false, family: Family::Woodwind },
         ];
         let mut notes = Vec::new();
         // Piano: arpeggio hitting around t=5
@@ -349,7 +360,7 @@ mod tests {
             notes.push(SceneNote { start: 9.0, end: 10.0, pitch: p, vel: 0.9, track: 0 });
         }
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true, false)
+        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true, false, true)
     }
 
     #[test]
@@ -434,11 +445,11 @@ mod tests {
         }
         for p in [50u8, 57, 62] { notes.push(SceneNote { start: 4.0, end: 9.0, pitch: p, vel: 0.6, track: 1 }); }
         let tracks = vec![
-            SceneTrack { color: [255, 255, 255], is_piano: true },
-            SceneTrack { color: [80, 160, 255], is_piano: false },
+            SceneTrack { color: [255, 255, 255], is_piano: true, family: render::Family::Piano },
+            SceneTrack { color: [80, 160, 255], is_piano: false, family: render::Family::Strings },
         ];
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        let scene = Scene::new(notes, tracks, beats, 1280, 720, false, 12.0, true, true, false, true, true, true, true);
+        let scene = Scene::new(notes, tracks, beats, 1280, 720, false, 12.0, true, true, false, true, true, true, true, false);
 
         let (w, h, fps, b) = (1280, 720, 30, 0.5f64);
         let fc = format!(

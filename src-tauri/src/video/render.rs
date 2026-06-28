@@ -88,9 +88,14 @@ pub struct Scene {
     countdown_pips: bool,
     transparent_bg: bool,      // leave the note field transparent (composite over a bg video)
     orchestra: bool,           // animated 2D orchestra pit across the top
+    measure_markers: bool,     // barlines + measure numbers (#1)
+    minimap: bool,             // whole-piece density strip + playhead (#2)
+    measure_tint: bool,        // per-measure 6-color wash (#3)
     clip_dur: f64,             // total clip length, for the progress bar
     piano_onsets: Vec<f64>,    // sorted distinct piano onset times (for cues)
     pit_families: Vec<Family>, // distinct non-piano families present, seating order
+    measures: Vec<(f64, u32)>, // (clip-relative downbeat time, measure number), sorted
+    minimap_hist: Vec<f32>,    // normalized note-density histogram across the clip
 }
 
 const PARTICLE_MAX_LIFE: f64 = 0.85;
@@ -303,6 +308,10 @@ impl Scene {
         countdown_pips: bool,
         transparent_bg: bool,
         orchestra: bool,
+        measure_markers: bool,
+        minimap: bool,
+        measure_tint: bool,
+        measures: Vec<(f64, u32)>,
     ) -> Scene {
         let (kb_size, hit, key_extent, lookahead) = if horizontal {
             let kb = (width as f32 * 0.085).clamp(110.0, 220.0);
@@ -353,6 +362,37 @@ impl Scene {
             .filter(|f| tracks.iter().any(|t| t.family == *f && !t.is_piano))
             .collect();
 
+        // Minimap density histogram across the clip. Weight piano onsets (the
+        // repeated figures the user is tracking show as humps); fall back to all
+        // notes if there's no piano part. Smoothed and peak-normalized.
+        const MM_BINS: usize = 320;
+        let mut hist = vec![0.0f32; MM_BINS];
+        let has_piano = tracks.iter().any(|t| t.is_piano);
+        if clip_dur > 0.0 {
+            for n in &notes {
+                let use_it = if has_piano { tracks[n.track].is_piano } else { true };
+                if !use_it { continue; }
+                let b = ((n.start / clip_dur) * MM_BINS as f64).floor();
+                if b >= 0.0 && (b as usize) < MM_BINS {
+                    hist[b as usize] += 0.4 + n.vel; // weight by velocity a touch
+                }
+            }
+        }
+        // 3-tap smoothing
+        let mut smoothed = hist.clone();
+        for i in 1..MM_BINS - 1 {
+            smoothed[i] = hist[i - 1] * 0.25 + hist[i] * 0.5 + hist[i + 1] * 0.25;
+        }
+        let peak = smoothed.iter().cloned().fold(1e-3, f32::max);
+        let minimap_hist: Vec<f32> = smoothed.iter().map(|v| (v / peak).min(1.0)).collect();
+
+        // Measures: clip-relative downbeat time + number, within the clip window.
+        let mut measures: Vec<(f64, u32)> = measures
+            .into_iter()
+            .filter(|(t, _)| *t > -2.0 && *t < clip_dur + 2.0)
+            .collect();
+        measures.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
         // Bucket notes by integer second of "needs drawing" interval:
         // visible from (start - lookahead) until particles finish (end + life).
         let n_buckets = (clip_dur.ceil() as usize + 2).max(1);
@@ -387,9 +427,14 @@ impl Scene {
             countdown_pips,
             transparent_bg,
             orchestra,
+            measure_markers,
+            minimap,
+            measure_tint,
             clip_dur,
             piano_onsets,
             pit_families,
+            measures,
+            minimap_hist,
         }
     }
 
@@ -407,6 +452,7 @@ impl Scene {
     pub fn render_frame(&self, t: f64) -> Vec<u8> {
         let mut pm = Pixmap::new(self.width, self.height).expect("pixmap");
         self.draw_background(&mut pm);
+        if self.measure_tint { self.draw_measure_tint(&mut pm, t); }
         self.draw_beat_lines(&mut pm, t);
 
         let active: &[u32] = self
@@ -420,6 +466,9 @@ impl Scene {
         self.draw_notes(&mut pm, t, active, false);
         self.draw_piano_beams(&mut pm, t, active);
         self.draw_notes(&mut pm, t, active, true);
+
+        // Measure barlines + traveling numbers ride with the notes.
+        if self.measure_markers { self.draw_measure_lines(&mut pm, t); }
 
         self.draw_hit_line(&mut pm, t);
         self.draw_keyboard(&mut pm, t, active);
@@ -439,6 +488,8 @@ impl Scene {
         if self.countdown_pips { self.draw_countdown_pips(&mut pm, t, active); }
         if self.beat_pulse { self.draw_beat_pulse(&mut pm, t); }
         if self.progress_bar { self.draw_progress_bar(&mut pm, t); }
+        if self.minimap { self.draw_minimap(&mut pm, t); }
+        if self.measure_markers { self.draw_measure_readout(&mut pm, t); }
 
         pm.take()
     }
@@ -501,6 +552,158 @@ impl Scene {
             pm.fill_path(&path, &solid(rgba([220, 245, 255], 1.0), BlendMode::SourceOver),
                 FillRule::Winding, Transform::identity(), None);
         }
+    }
+
+    // ── 7-segment number rendering (tiny-skia has no text) ──────────────────
+    // Draw a digit 0-9 as seven rounded bars within a box of (w, h) at (x, y).
+    fn draw_digit(pm: &mut Pixmap, d: u8, x: f32, y: f32, w: f32, h: f32, th: f32, color: Color) {
+        // segments: a(top) b(tr) c(br) d(bot) e(bl) f(tl) g(mid)
+        const SEG: [[bool; 7]; 10] = [
+            [true, true, true, true, true, true, false],   // 0
+            [false, true, true, false, false, false, false], // 1
+            [true, true, false, true, true, false, true],   // 2
+            [true, true, true, true, false, false, true],   // 3
+            [false, true, true, false, false, true, true],  // 4
+            [true, false, true, true, false, true, true],   // 5
+            [true, false, true, true, true, true, true],    // 6
+            [true, true, true, false, false, false, false], // 7
+            [true, true, true, true, true, true, true],     // 8
+            [true, true, true, true, false, true, true],    // 9
+        ];
+        let on = &SEG[(d % 10) as usize];
+        let p = solid(color, BlendMode::SourceOver);
+        let half = (h - th) / 2.0;
+        let hbar = |pm: &mut Pixmap, yy: f32| fill_round_rect(pm, x + th * 0.5, yy, w - th, th, th * 0.5, &p);
+        let vbar = |pm: &mut Pixmap, xx: f32, yy: f32| fill_round_rect(pm, xx, yy + th * 0.5, th, half - th * 0.5, th * 0.5, &p);
+        if on[0] { hbar(pm, y); }                       // a
+        if on[3] { hbar(pm, y + h - th); }              // d
+        if on[6] { hbar(pm, y + (h - th) / 2.0); }      // g
+        if on[5] { vbar(pm, x, y); }                    // f
+        if on[1] { vbar(pm, x + w - th, y); }           // b
+        if on[4] { vbar(pm, x, y + half); }             // e
+        if on[2] { vbar(pm, x + w - th, y + half); }    // c
+    }
+
+    /// Draw an integer; `cx` is the left edge unless `center`, then it's the
+    /// center. Returns total width.
+    fn draw_int(pm: &mut Pixmap, n: u32, anchor_x: f32, top_y: f32, digit_h: f32, color: Color, center: bool) -> f32 {
+        let s = n.to_string();
+        let dw = digit_h * 0.62;
+        let gap = digit_h * 0.18;
+        let th = (digit_h * 0.16).max(2.0);
+        let total = s.len() as f32 * dw + (s.len() as f32 - 1.0) * gap;
+        let mut x = if center { anchor_x - total / 2.0 } else { anchor_x };
+        for ch in s.bytes() {
+            Self::draw_digit(pm, ch - b'0', x, top_y, dw, digit_h, th, color);
+            x += dw + gap;
+        }
+        total
+    }
+
+    fn current_measure(&self, t: f64) -> Option<u32> {
+        // Largest measure whose downbeat time <= t.
+        let i = self.measures.partition_point(|(mt, _)| *mt <= t);
+        if i == 0 { self.measures.first().map(|(_, n)| *n) } else { Some(self.measures[i - 1].1) }
+    }
+
+    // ── #1 Measure barlines + traveling numbers ─────────────────────────────
+    fn draw_measure_lines(&self, pm: &mut Pixmap, t: f64) {
+        let w = self.width as f32;
+        let h = self.height as f32;
+        let digit_h = (h * 0.040).clamp(22.0, 52.0);
+        let line = solid(rgba([255, 240, 200], 0.55), BlendMode::Plus);
+        let glow = solid(rgba([255, 220, 150], 0.18), BlendMode::Plus);
+        for &(mt, num) in &self.measures {
+            let dt = mt - t;
+            if dt < -0.25 || dt > self.lookahead + 0.25 { continue; }
+            let a = self.time_to_axis(dt);
+            if self.horizontal {
+                if a < self.hit - 4.0 || a > w + 4.0 { continue; }
+                fill_rect(pm, a - 2.5, 0.0, 5.0, h, &glow);
+                fill_rect(pm, a - 1.0, 0.0, 2.0, h, &line);
+                Self::draw_int(pm, num, a + 6.0, 8.0, digit_h, rgba([255, 246, 220], 0.95), false);
+            } else {
+                if a < -4.0 || a > self.hit + 4.0 { continue; }
+                fill_rect(pm, 0.0, a - 2.5, w, 5.0, &glow);
+                fill_rect(pm, 0.0, a - 1.0, w, 2.0, &line);
+                // number to the left, vertically centered on the line
+                Self::draw_int(pm, num, 10.0, a - digit_h - 4.0, digit_h, rgba([255, 246, 220], 0.95), false);
+            }
+        }
+    }
+
+    /// Large always-on current-measure readout with a backing plate.
+    fn draw_measure_readout(&self, pm: &mut Pixmap, t: f64) {
+        let Some(num) = self.current_measure(t) else { return };
+        let h = self.height as f32;
+        let digit_h = (h * 0.060).clamp(34.0, 78.0);
+        // Sit just right of the keyboard in horizontal mode, else top-left.
+        let x0 = if self.horizontal { self.kb_size + 18.0 } else { 20.0 };
+        let y0 = 30.0;
+        let dw = digit_h * 0.62;
+        let gap = digit_h * 0.18;
+        let digits = num.to_string().len() as f32;
+        let num_w = digits * dw + (digits - 1.0) * gap;
+        let pad = digit_h * 0.28;
+        // backing plate
+        fill_round_rect(pm, x0 - pad, y0 - pad * 0.7, num_w + pad * 2.0, digit_h + pad * 1.4, 8.0,
+            &solid(Color::from_rgba8(10, 12, 20, 200), BlendMode::SourceOver));
+        fill_round_rect(pm, x0 - pad, y0 - pad * 0.7, num_w + pad * 2.0, 3.0, 2.0,
+            &solid(rgba([255, 220, 150], 0.5), BlendMode::Plus)); // accent top edge
+        Self::draw_int(pm, num, x0, y0, digit_h, rgba([255, 248, 224], 0.98), false);
+    }
+
+    // ── #2 Whole-piece minimap with playhead ────────────────────────────────
+    fn draw_minimap(&self, pm: &mut Pixmap, t: f64) {
+        if self.minimap_hist.is_empty() || self.clip_dur <= 0.0 { return; }
+        let w = self.width as f32;
+        let pad = w * 0.04;
+        let bw = w - pad * 2.0;
+        let y = 52.0;       // below the progress bar
+        let strip_h = (self.height as f32 * 0.05).clamp(26.0, 60.0);
+        // backing
+        fill_round_rect(pm, pad - 6.0, y - 4.0, bw + 12.0, strip_h + 8.0, 6.0,
+            &solid(Color::from_rgba8(8, 10, 18, 170), BlendMode::SourceOver));
+        // density silhouette
+        let bins = self.minimap_hist.len();
+        let base_y = y + strip_h;
+        for i in 0..bins {
+            let bx = pad + bw * (i as f32 / bins as f32);
+            let bwid = (bw / bins as f32) + 1.0;
+            let v = self.minimap_hist[i];
+            let bh = v * strip_h;
+            fill_rect(pm, bx, base_y - bh, bwid, bh, &solid(rgba([90, 150, 220], 0.5 + v * 0.4), BlendMode::SourceOver));
+        }
+        // measure ticks along the minimap (subtle structure)
+        for &(mt, _) in &self.measures {
+            if mt < 0.0 || mt > self.clip_dur { continue; }
+            let mx = pad + bw * (mt / self.clip_dur) as f32;
+            fill_rect(pm, mx, base_y - 3.0, 1.0, 3.0, &solid(rgba([255, 255, 255], 0.12), BlendMode::Plus));
+        }
+        // playhead
+        let px = pad + bw * (t / self.clip_dur).clamp(0.0, 1.0) as f32;
+        glow_disc(pm, px, base_y - strip_h * 0.5, 14.0, [255, 230, 150], 0.5);
+        fill_rect(pm, px - 1.0, y - 3.0, 2.0, strip_h + 6.0, &solid(rgba([255, 240, 200], 0.95), BlendMode::SourceOver));
+        // played region dim overlay
+        fill_rect(pm, pad, y, (px - pad).max(0.0), strip_h, &solid(Color::from_rgba8(0, 0, 0, 70), BlendMode::SourceOver));
+    }
+
+    // ── #3 Per-measure 6-color tint ─────────────────────────────────────────
+    fn draw_measure_tint(&self, pm: &mut Pixmap, t: f64) {
+        let Some(num) = self.current_measure(t) else { return };
+        const PAL: [[u8; 3]; 6] = [
+            [70, 110, 200], [80, 170, 120], [200, 150, 70],
+            [180, 90, 165], [90, 175, 195], [200, 110, 90],
+        ];
+        let c = PAL[(num as usize) % 6];
+        let w = self.width as f32;
+        // Tint only the note field (above the hit line), as a soft wash.
+        let (rx, ry, rw, rh) = if self.horizontal {
+            (self.hit, 0.0, w - self.hit, self.height as f32)
+        } else {
+            (0.0, 0.0, w, self.hit)
+        };
+        fill_rect(pm, rx, ry, rw, rh, &solid(rgba(c, 0.085), BlendMode::SourceOver));
     }
 
     // ── Next-note cue (micro: highlight the immediate upcoming piano notes) ──

@@ -3,7 +3,8 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 type CueKey =
   | "beatPulse" | "orchestraBars" | "tempoPendulum"
-  | "progressBar" | "nextNoteCue" | "countdownPips" | "orchestra";
+  | "progressBar" | "nextNoteCue" | "countdownPips" | "orchestra"
+  | "measureMarkers" | "minimap" | "measureTint";
 
 export interface VideoExportOpts extends Record<CueKey, boolean> {
   orientation: "vertical" | "horizontal";
@@ -12,14 +13,19 @@ export interface VideoExportOpts extends Record<CueKey, boolean> {
   speed: number; // fraction: 1 = normal, 0.8 = 80% for slow practice
   bgVideoPath: string | null; // full-screen background video (any local file)
   bgBrightness: number;       // 0..1 dimmer for the background
+  beatsPerMeasure: number;    // for measure numbering
 }
 
 const CUE_DEFAULTS: Record<CueKey, boolean> = {
   beatPulse: true, orchestraBars: true, tempoPendulum: false,
   progressBar: true, nextNoteCue: true, countdownPips: true, orchestra: false,
+  measureMarkers: true, minimap: true, measureTint: false,
 };
 
 const CUES: { key: CueKey; label: string; desc: string }[] = [
+  { key: "measureMarkers", label: "Measure numbers", desc: "Big current-measure readout + heavier barlines with measure numbers that travel with the notes, so you always know which bar (and which repeat) you're on" },
+  { key: "minimap", label: "Minimap", desc: "A whole-piece overview strip with a playhead — repeated figures show as repeated humps, so you can see which one you're in at a glance" },
+  { key: "measureTint", label: "Measure color cycle", desc: "Subtle background wash that cycles through 6 colors by measure, so consecutive bars look distinct even when the notes repeat" },
   { key: "orchestra", label: "Animated orchestra", desc: "A cartoon orchestra across the top: sections bow/strike from the MIDI, a pianist whose hands track your register, and a conductor on the podium" },
   { key: "progressBar", label: "Progress bar", desc: "Bar across the top tracking your position through the piece — where am I overall" },
   { key: "nextNoteCue", label: "Next-note cue", desc: "Rings the immediate upcoming piano note(s) with a guide line so you always see what you play next" },
@@ -64,6 +70,9 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
     const v = parseInt(localStorage.getItem("beats_video_bg_brightness") ?? "60");
     return isFinite(v) ? v : 60;
   });
+  const [beatsPerMeasureStr, setBeatsPerMeasureStr] = useState(() =>
+    localStorage.getItem("beats_video_bpm_count") || "4"
+  );
   const [cues, setCues] = useState<Record<string, boolean>>(() => {
     try {
       const raw = localStorage.getItem("beats_video_cues");
@@ -100,15 +109,19 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
     localStorage.removeItem("beats_video_bg_path");
   }
 
+  const beatsPerMeasure = Math.max(1, Math.min(16, parseInt(beatsPerMeasureStr) || 4));
+
   function handleConfirm() {
     if (!valid) return;
     localStorage.setItem("beats_video_cues", JSON.stringify(cues));
     localStorage.setItem("beats_video_bg_brightness", String(bgBrightnessPct));
+    localStorage.setItem("beats_video_bpm_count", String(beatsPerMeasure));
     onConfirm({
       speed: speedPct / 100,
       orientation, start: start!, end: Math.min(end!, totalDuration),
       bgVideoPath,
       bgBrightness: bgBrightnessPct / 100,
+      beatsPerMeasure,
       beatPulse: !!cues.beatPulse,
       orchestraBars: !!cues.orchestraBars,
       tempoPendulum: !!cues.tempoPendulum,
@@ -116,6 +129,9 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
       nextNoteCue: !!cues.nextNoteCue,
       countdownPips: !!cues.countdownPips,
       orchestra: !!cues.orchestra,
+      measureMarkers: !!cues.measureMarkers,
+      minimap: !!cues.minimap,
+      measureTint: !!cues.measureTint,
     });
   }
 
@@ -264,6 +280,25 @@ export default function ExportVideoModal({ totalDuration, onConfirm, onCancel }:
               </label>
             ))}
           </div>
+
+          {(cues.measureMarkers || cues.measureTint) && (
+            <div className="modal-row modal-row-input" style={{ marginTop: 4 }}>
+              <label className="modal-label" htmlFor="bpmeas">Beats per measure</label>
+              <div className="modal-input-group">
+                <input
+                  id="bpmeas"
+                  className="modal-input"
+                  type="number"
+                  min="1"
+                  max="16"
+                  step="1"
+                  value={beatsPerMeasureStr}
+                  onChange={(e) => setBeatsPerMeasureStr(e.target.value)}
+                  style={{ width: 60 }}
+                />
+              </div>
+            </div>
+          )}
 
           {videoLen !== null && (
             <div className="modal-preview">

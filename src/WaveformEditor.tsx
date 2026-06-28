@@ -2493,6 +2493,16 @@ export default function WaveformEditor({
     });
     const vBeats = beatsRef.current.map(b => originalToStretched(b, sts));
 
+    // Measure downbeats: every Nth beat (first beat = downbeat), numbered from 1,
+    // mapped to the output (stretched) timeline. Rust trims to the clip window.
+    const bpMeasure = Math.max(1, opts.beatsPerMeasure || 4);
+    const measureTimes: number[] = [];
+    const measureNumbers: number[] = [];
+    for (let gi = 0, m = 1; gi < vBeats.length; gi += bpMeasure, m++) {
+      measureTimes.push(vBeats[gi]);
+      measureNumbers.push(m);
+    }
+
     setVideoProgress({ pct: 0, stage: "Starting" });
     try {
       await invoke("export_video", {
@@ -2517,6 +2527,11 @@ export default function WaveformEditor({
           next_note_cue: opts.nextNoteCue,
           countdown_pips: opts.countdownPips,
           orchestra: opts.orchestra,
+          measure_markers: opts.measureMarkers,
+          minimap: opts.minimap,
+          measure_tint: opts.measureTint,
+          measure_times: measureTimes,
+          measure_numbers: measureNumbers,
           bg_video_path: opts.bgVideoPath,
           bg_brightness: opts.bgBrightness,
         },

@@ -49,6 +49,18 @@ pub struct VideoOptions {
     pub countdown_pips: bool,
     #[serde(default)]
     pub orchestra: bool,
+    #[serde(default)]
+    pub measure_markers: bool,
+    #[serde(default)]
+    pub minimap: bool,
+    #[serde(default)]
+    pub measure_tint: bool,
+    /// Parallel arrays: downbeat times (output-timeline secs, pre clip-trim) and
+    /// their measure numbers. Empty disables measure features.
+    #[serde(default)]
+    pub measure_times: Vec<f64>,
+    #[serde(default)]
+    pub measure_numbers: Vec<u32>,
     /// Playback speed as a fraction (1.0 = normal, 0.8 = 80% for slow practice).
     /// Audio is time-stretched (pitch-preserved) and the visuals slowed to match.
     #[serde(default = "default_speed")]
@@ -170,6 +182,13 @@ pub async fn export_video(
             .map(|b| b - clip_start)
             .filter(|b| *b > -30.0 && *b < clip_dur + 30.0)
             .collect();
+        // Measures → (clip-relative downbeat time, number).
+        let scene_measures: Vec<(f64, u32)> = options
+            .measure_times
+            .iter()
+            .zip(options.measure_numbers.iter())
+            .map(|(&mt, &num)| (mt - clip_start, num))
+            .collect();
         let scene = Scene::new(
             scene_notes,
             scene_tracks,
@@ -186,6 +205,10 @@ pub async fn export_video(
             options.countdown_pips,
             options.bg_video_path.is_some(),
             options.orchestra,
+            options.measure_markers,
+            options.minimap,
+            options.measure_tint,
+            scene_measures,
         );
 
         // ── Stage 5: render frames → ffmpeg (40–100 %) ─────────────────────
@@ -360,7 +383,9 @@ mod tests {
             notes.push(SceneNote { start: 9.0, end: 10.0, pitch: p, vel: 0.9, track: 0 });
         }
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true, false, true)
+        // Measures every 4 beats, numbered from 1.
+        let measures: Vec<(f64, u32)> = (0..5).map(|m| (m as f64 * 4.0 * 0.55, (m + 1) as u32)).collect();
+        Scene::new(notes, tracks, beats, 1280, 720, horizontal, 12.0, true, true, true, true, true, true, false, true, true, true, true, measures)
     }
 
     #[test]
@@ -449,7 +474,7 @@ mod tests {
             SceneTrack { color: [80, 160, 255], is_piano: false, family: render::Family::Strings },
         ];
         let beats: Vec<f64> = (0..20).map(|i| i as f64 * 0.55).collect();
-        let scene = Scene::new(notes, tracks, beats, 1280, 720, false, 12.0, true, true, false, true, true, true, true, false);
+        let scene = Scene::new(notes, tracks, beats, 1280, 720, false, 12.0, true, true, false, true, true, true, true, false, false, false, false, Vec::new());
 
         let (w, h, fps, b) = (1280, 720, 30, 0.5f64);
         let fc = format!(
